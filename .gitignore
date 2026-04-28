@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.swp
+.idea/
+.vscode/
+*.tmp
+*.bak
+
+# Local development scratch
+/scratch/
+/test-output/
+
+# Don't commit user config artifacts that test runs may produce
+**/.claude/summaries/
+**/precompact.conf
