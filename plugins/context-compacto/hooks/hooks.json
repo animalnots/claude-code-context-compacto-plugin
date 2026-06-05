@@ -21,6 +21,17 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/sessionstart_notice.py\"",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

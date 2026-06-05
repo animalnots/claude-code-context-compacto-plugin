@@ -107,7 +107,7 @@ def _show():
     if CONF.exists():
         sys.stdout.write(CONF.read_text(encoding="utf-8"))
     else:
-        print("(defaults: head_tokens=0  tail_tokens=30000  model_200k=sonnet  model_1m=opus[1m])")
+        print("(defaults: head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m])")
 
 
 def _reset():
@@ -146,7 +146,7 @@ Scope: ~/.claude/precompact.conf is GLOBAL. Edits take effect on the NEXT compac
   in any session — current, other running sessions, or future ones. No per-session
   snapshot. Env vars (if set) override the file for that shell.
 
-Defaults (no config, no env): head_tokens=0  tail_tokens=30000  model_200k=sonnet  model_1m=opus[1m]
+Defaults (no config, no env): head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]
 Config file: ~/.claude/precompact.conf
 
 Precedence per window (head and tail resolved independently):
@@ -157,7 +157,7 @@ Precedence per window (head and tail resolved independently):
   3. env  PRECOMPACT_HEAD_PCT    / PRECOMPACT_TAIL_PCT
   4. file head_pct    / tail_pct
   5. PRECOMPACT_WINDOW_TOKENS (legacy symmetric, env or file)
-  6. built-in default (head=0, tail=30000)
+  6. built-in default (head=0, tail=25000)
 """
 
 

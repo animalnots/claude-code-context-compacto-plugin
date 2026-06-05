@@ -28,7 +28,7 @@ Other (the middle is summarized by a model picked automatically from its size):
 
 Mutex per window (last command wins): /cc:begin clears head_pct; /cc:begin-pct clears head_tokens. Same for tail.
 Scope: ~/.claude/precompact.conf is global. Changes apply on the NEXT compact in any session — current, other running, or new. There is no per-session snapshot.
-Defaults: head_tokens=0  tail_tokens=30000  model_200k=sonnet  model_1m=opus[1m]
+Defaults: head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]
 Config file: ~/.claude/precompact.conf
 
 Precedence per window (TOKENS beats PCT, env beats file):
@@ -37,5 +37,5 @@ Precedence per window (TOKENS beats PCT, env beats file):
   3. env  PRECOMPACT_HEAD_PCT    / PRECOMPACT_TAIL_PCT
   4. file head_pct    / tail_pct
   5. PRECOMPACT_WINDOW_TOKENS (legacy symmetric)
-  6. built-in default (head=0, tail=30000)
+  6. built-in default (head=0, tail=25000)
 ```

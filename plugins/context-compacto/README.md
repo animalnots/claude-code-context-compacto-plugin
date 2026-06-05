@@ -78,7 +78,7 @@ model_1m=opus[1m]
 
 You can mix the two modes across head and tail (e.g. `head_tokens=...` + `tail_pct=...`), but TOKENS and PCT for the **same** window shouldn't both be set — TOKENS will win.
 
-Defaults if everything is unset: `head_tokens=0  tail_tokens=30000  model_200k=sonnet  model_1m=opus[1m]` — i.e. summarize everything except the last 30k tokens, using `sonnet` for normal-size middles and escalating to `opus[1m]` for oversized ones. Override with `/cc:begin /cc:end /cc:begin-pct /cc:end-pct /cc:model200k /cc:model1m` (or env vars) when you want different behavior. (Legacy `model=` is still read as `model_200k`.)
+Defaults if everything is unset: `head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]` — i.e. summarize everything except the last 25k tokens, using `sonnet` for normal-size middles and escalating to `opus[1m]` for oversized ones. Override with `/cc:begin /cc:end /cc:begin-pct /cc:end-pct /cc:model200k /cc:model1m` (or env vars) when you want different behavior. (Legacy `model=` is still read as `model_200k`.)
 
 ## Precedence
 
@@ -90,7 +90,7 @@ For each window, head and tail are resolved independently. **TOKENS beats PCT** 
 3. env  PRECOMPACT_HEAD_PCT     / PRECOMPACT_TAIL_PCT
 4. file head_pct                / tail_pct
 5. PRECOMPACT_WINDOW_TOKENS     (legacy symmetric, env or file)
-6. built-in default             (head=0, tail=30000)
+6. built-in default             (head=0, tail=25000)
 ```
 
 **How percent is computed:** `pct% × (total token cost of the conversation post-dedup, pre-compression)`. Example: 200,000-token session with `head_pct=10` → head budget = 20,000 tokens.

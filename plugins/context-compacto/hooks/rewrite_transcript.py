@@ -15,7 +15,7 @@ Beyond selecting the head/tail windows by token budget, this also:
   - strips `message.usage` (cached API token counts) and `toolUseResult` metadata
   - reassigns every UUID so Claude Code can't re-hydrate the fork from other session files
 
-Defaults (when no env / config is set): head_tokens=0, tail_tokens=30000.
+Defaults (when no env / config is set): head_tokens=0, tail_tokens=25000.
 Both can be overridden via env:
   PRECOMPACT_HEAD_TOKENS / PRECOMPACT_TAIL_TOKENS  (absolute)
   PRECOMPACT_HEAD_PCT    / PRECOMPACT_TAIL_PCT     (percent of total)
@@ -33,7 +33,7 @@ MAX_BLOCK_TOKENS = int(os.environ.get("PRECOMPACT_MAX_BLOCK_TOKENS", "3000"))
 
 
 DEFAULT_HEAD_TOKENS = 0
-DEFAULT_TAIL_TOKENS = 30000
+DEFAULT_TAIL_TOKENS = 25000
 
 
 def resolve_budgets(total_tokens: int) -> Tuple[int, int]:
@@ -43,7 +43,7 @@ def resolve_budgets(total_tokens: int) -> Tuple[int, int]:
       1. PRECOMPACT_HEAD_TOKENS / PRECOMPACT_TAIL_TOKENS (absolute tokens)
       2. PRECOMPACT_HEAD_PCT / PRECOMPACT_TAIL_PCT (percent of total_tokens)
       3. PRECOMPACT_WINDOW_TOKENS (legacy symmetric fallback)
-      4. built-in default: head=0, tail=30000
+      4. built-in default: head=0, tail=25000
 
     Percentage paths need total_tokens from the actual conversation, so
     callers must pass the summed token cost of the (prepared) convo.
