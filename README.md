@@ -25,7 +25,8 @@ That's it. Restart Claude Code if needed.
 /cc:show                       # see current config
 /cc:begin 25000                # keep first 25k tokens verbatim   (default 0)
 /cc:end 30000                  # keep last 30k tokens verbatim    (default 30k)
-/cc:model sonnet[1m]           # summarizer model                 (default sonnet[1m])
+/cc:model200k sonnet           # model for normal-size middles    (default sonnet)
+/cc:model1m opus[1m]           # model for oversized middles      (default opus[1m])
 /cc:help                       # all commands
 ```
 

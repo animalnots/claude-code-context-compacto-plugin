@@ -5,7 +5,7 @@ Replaces Claude Code's native `/compact` with a token-budget head/middle/tail co
 ## What it does
 
 1. The `PreCompact` hook intercepts auto and manual compactions.
-2. It reads the live transcript JSONL, splits it into `head_tokens` first + `tail_tokens` last, and ships the middle to a summarizer (default `sonnet[1m]`).
+2. It reads the live transcript JSONL, splits it into `head_tokens` first + `tail_tokens` last, and ships the middle to a summarizer. The model is chosen by the middle's size: `model_200k` (default `sonnet`) when it fits a standard window, otherwise `model_1m` (default `opus[1m]`); if the 200k call errors it escalates to the 1M model.
 3. The summarizer outputs a fixed-shape markdown block:
    - `## Narrative`
    - `## Achievements`
@@ -50,7 +50,9 @@ All commands are namespaced under the plugin's prefix `/cc:` (Claude Code does t
 
 | Command           | Effect |
 |-------------------|--------|
-| `/cc:model ID`    | summarizer model (`sonnet[1m]`, `opus[1m]`, `haiku`, …) |
+| `/cc:model200k ID` | standard-context summarizer, used when the middle fits ≤200k (e.g. `sonnet`) |
+| `/cc:model1m ID`   | 1M-context summarizer, used when the middle is bigger (e.g. `opus[1m]`) |
+| `/cc:model ID`     | alias for `/cc:model200k` |
 | `/cc:show`        | print current config |
 | `/cc:reset`       | delete config (revert to defaults) |
 | `/cc:help`        | inline help |
@@ -70,12 +72,13 @@ tail_tokens=20000
 head_pct=10
 tail_pct=20
 
-model=sonnet[1m]
+model_200k=sonnet
+model_1m=opus[1m]
 ```
 
 You can mix the two modes across head and tail (e.g. `head_tokens=...` + `tail_pct=...`), but TOKENS and PCT for the **same** window shouldn't both be set — TOKENS will win.
 
-Defaults if everything is unset: `head_tokens=0  tail_tokens=30000  model=sonnet[1m]` — i.e. summarize everything except the last 30k tokens. Override with `/cc:begin /cc:end /cc:begin-pct /cc:end-pct` (or env vars) when you want different behavior.
+Defaults if everything is unset: `head_tokens=0  tail_tokens=30000  model_200k=sonnet  model_1m=opus[1m]` — i.e. summarize everything except the last 30k tokens, using `sonnet` for normal-size middles and escalating to `opus[1m]` for oversized ones. Override with `/cc:begin /cc:end /cc:begin-pct /cc:end-pct /cc:model200k /cc:model1m` (or env vars) when you want different behavior. (Legacy `model=` is still read as `model_200k`.)
 
 ## Precedence
 
@@ -114,9 +117,11 @@ PRECOMPACT_HEAD_TOKENS=20000
 PRECOMPACT_TAIL_TOKENS=20000
 PRECOMPACT_HEAD_PCT=25
 PRECOMPACT_TAIL_PCT=20
-PRECOMPACT_MODEL=opus[1m]
+PRECOMPACT_MODEL_200K=sonnet
+PRECOMPACT_MODEL_1M=opus[1m]
 PRECOMPACT_MAX_BLOCK_TOKENS=3000      # truncation cap for tool_result / attachment file content
-PRECOMPACT_MAX_CHARS=200000           # max chars sent to summarizer
+PRECOMPACT_STD_CTX_LIMIT=180000       # max middle tokens for the 200k slot before switching to 1M
+PRECOMPACT_LONG_CTX_LIMIT=900000      # max middle tokens sent to the 1M slot
 ```
 
 ## Resume after compaction

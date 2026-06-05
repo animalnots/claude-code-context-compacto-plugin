@@ -17,15 +17,18 @@ Percentage budgets (N = percent of total convo tokens, head_pct + tail_pct ≤ 1
   /cc:end-pct N      set tail as %             (e.g. /cc:end-pct 20    → tail_pct=20)
   /cc:both-pct N     set both                  (e.g. /cc:both-pct 25   → head_pct=tail_pct=25; N ≤ 50)
 
-Other:
-  /cc:model MODEL    set summarizer model      (e.g. /cc:model opus[1m])
+Other (the middle is summarized by a model picked automatically from its size):
+  /cc:model200k ID   model when the middle fits standard context  (e.g. /cc:model200k sonnet)
+  /cc:model1m ID     model when the middle needs 1M context        (e.g. /cc:model1m opus[1m])
+  /cc:model ID       alias for /cc:model200k
   /cc:show           print current config
   /cc:reset          clear config (defaults restored)
   /cc:help           this help
+  [1m] models need the long-context beta / usage credits (opus[1m] works on Claude Max).
 
 Mutex per window (last command wins): /cc:begin clears head_pct; /cc:begin-pct clears head_tokens. Same for tail.
 Scope: ~/.claude/precompact.conf is global. Changes apply on the NEXT compact in any session — current, other running, or new. There is no per-session snapshot.
-Defaults: head_tokens=0  tail_tokens=30000  model=sonnet[1m]
+Defaults: head_tokens=0  tail_tokens=30000  model_200k=sonnet  model_1m=opus[1m]
 Config file: ~/.claude/precompact.conf
 
 Precedence per window (TOKENS beats PCT, env beats file):

@@ -2,9 +2,9 @@
 """Cross-platform precompact config helper.
 
 Invoked by the begin / end / both / begin-pct / end-pct / both-pct / model /
-show / reset / help slash-command files (each lives under the `cc` plugin, so
-they're typed as /cc:begin /cc:end etc.). Reads & writes the persistent config
-at ~/.claude/precompact.conf.
+model200k / model1m / show / reset / help slash-command files (each lives under
+the `cc` plugin, so they're typed as /cc:begin /cc:end etc.). Reads & writes the
+persistent config at ~/.claude/precompact.conf.
 
 Usage:
   python pcconf.py <cmd> [arg]
@@ -14,7 +14,9 @@ Usage:
     begin-pct N  head_pct = N            (percent of total; clears head_tokens)
     end-pct N    tail_pct = N            (percent of total; clears tail_tokens)
     both-pct N   head_pct = tail_pct = N (clears head_tokens, tail_tokens; N ≤ 50)
-    model MODEL  summarizer model id
+    model200k ID standard-context summarizer model (clears legacy `model`)
+    model1m ID   1M-context summarizer model
+    model MODEL  alias for model200k
     show         print the current config (or defaults note)
     reset        delete the config file
     help         print usage
@@ -105,7 +107,7 @@ def _show():
     if CONF.exists():
         sys.stdout.write(CONF.read_text(encoding="utf-8"))
     else:
-        print("(defaults: head_tokens=0  tail_tokens=30000  model=sonnet[1m])")
+        print("(defaults: head_tokens=0  tail_tokens=30000  model_200k=sonnet  model_1m=opus[1m])")
 
 
 def _reset():
@@ -126,11 +128,16 @@ Percentage budgets (N = percent of total convo tokens, head_pct + tail_pct ≤ 1
   /cc:end-pct N      set tail as %             (e.g. /cc:end-pct 20    -> tail_pct=20)
   /cc:both-pct N     set both                  (e.g. /cc:both-pct 25   -> head_pct=tail_pct=25; N ≤ 50)
 
-Other:
-  /cc:model MODEL    set summarizer model      (e.g. /cc:model opus[1m])
+Other (the middle is summarized by a model picked automatically from its size):
+  /cc:model200k ID   model when the middle fits standard context  (e.g. /cc:model200k sonnet)
+  /cc:model1m ID     model when the middle needs 1M context        (e.g. /cc:model1m opus[1m])
+  /cc:model ID       alias for /cc:model200k
   /cc:show           print current config
   /cc:reset          clear config (defaults restored)
   /cc:help           this help
+
+Note: [1m] models need the long-context beta / usage credits. On Claude Max,
+  opus[1m] works; sonnet[1m] needs usage credits; standard models need neither.
 
 Mutex per window (last command wins): /cc:begin clears head_pct; /cc:begin-pct clears head_tokens.
   Mixing modes ACROSS windows is fine (e.g. head_tokens=20000 + tail_pct=15).
@@ -139,7 +146,7 @@ Scope: ~/.claude/precompact.conf is GLOBAL. Edits take effect on the NEXT compac
   in any session — current, other running sessions, or future ones. No per-session
   snapshot. Env vars (if set) override the file for that shell.
 
-Defaults (no config, no env): head_tokens=0  tail_tokens=30000  model=sonnet[1m]
+Defaults (no config, no env): head_tokens=0  tail_tokens=30000  model_200k=sonnet  model_1m=opus[1m]
 Config file: ~/.claude/precompact.conf
 
 Precedence per window (head and tail resolved independently):
@@ -209,8 +216,11 @@ def main():
             return
         _set("head_pct", str(n)); _set("tail_pct", str(n))
         _clear("head_tokens"); _clear("tail_tokens")
-    elif cmd == "model":
-        _set("model", arg if arg is not None else "sonnet[1m]")
+    elif cmd in ("model", "model200k"):
+        _set("model_200k", arg if arg is not None else "sonnet")
+        _clear("model")
+    elif cmd == "model1m":
+        _set("model_1m", arg if arg is not None else "opus[1m]")
     elif cmd == "show":
         _show()
         return
@@ -221,7 +231,7 @@ def main():
         sys.stdout.write(HELP)
         return
     else:
-        sys.stderr.write("usage: pcconf.py begin|end|both|begin-pct|end-pct|both-pct N | model MODEL | show | reset | help\n")
+        sys.stderr.write("usage: pcconf.py begin|end|both|begin-pct|end-pct|both-pct N | model|model200k|model1m MODEL | show | reset | help\n")
         sys.exit(1)
 
     # mutating commands fall through and print the resulting config
