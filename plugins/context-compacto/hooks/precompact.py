@@ -459,7 +459,7 @@ reason_parts = [f"precompact blocked ({trigger}); preview at {preview}."]
 if model_used:
     reason_parts.append(f"Summarized middle with {model_used}.")
 if fork_id:
-    reason_parts.append(f"Compressed fork written. Resume with:  claude --resume {fork_id}")
+    reason_parts.append(f"Compressed fork written. Resume in this chat with:  /resume {fork_id}   (or  claude --resume {fork_id}  from a new shell).")
 elif fork_error:
     reason_parts.append(f"Fork not created: {fork_error}")
 if summary_error:

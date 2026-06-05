@@ -31,8 +31,8 @@ try:
             "context-compacto active: /compact now keeps the last 25k tokens verbatim "
             "(head=0) and summarizes the middle (sonnet; opus[1m] for oversized middles). "
             "Tune with /cc:end /cc:begin /cc:model200k /cc:model1m, or see /cc:help. After "
-            "compacting, resume the compressed session with the printed `claude --resume <id>`."
-            "an easy way to resume is just to type `/resume` in existing chat and select the top option"
+            "compacting, load the compressed session in this chat with the printed "
+            "`/resume <id>` (or run `/resume` and pick the newest `compact …` entry)."
         )
         print(json.dumps({"systemMessage": msg}))
         claude_dir.mkdir(parents=True, exist_ok=True)

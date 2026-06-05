@@ -48,17 +48,13 @@ precompact wrote fork: <project>/<new-sid>.jsonl ; resume with: claude --resume 
 
 ### 3. Resume from the fork
 
-The current session is **untouched** (the hook blocks but doesn't rewrite it in place). To actually use the compressed fork:
+The current session is **untouched** (the hook blocks but doesn't rewrite it in place). The block message prints the fork's session id, so the easiest path is to load it in place — no need to leave the chat:
 
 ```
-/exit                          # leave the current (uncompacted) session
-claude --resume                # opens the session picker
+/resume <fork-id>              # the id printed in the block message
 ```
 
-In the picker, sessions are listed in reverse-chronological order:
-
-- **Top entry** = the session you just exited (still uncompacted — kept as a backup).
-- **Second from top** = the new compressed fork. **Pick this one.**
+`/resume` is built in: it swaps your current chat for another session in the same terminal (no `/exit` + relaunch). No id handy? Run `/resume` with no argument and pick the newest **`compact …`** entry — every fork is titled `compact MM-DD HH:MM`. A fresh-shell `claude --resume` opens the same picker.
 
 You're now in the forked session with head + summary + tail loaded. The original is preserved on disk in case you want to go back.
 

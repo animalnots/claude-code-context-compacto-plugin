@@ -1,6 +1,6 @@
 {
   "name": "cc",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Smarter /compact: keeps head and tail of your session verbatim, summarizes only the middle, writes a resumable forked transcript. No more context black hole after compaction.",
   "author": {
     "name": "Animalnots"
