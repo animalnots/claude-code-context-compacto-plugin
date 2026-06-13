@@ -27,6 +27,8 @@ All commands are namespaced under the plugin's prefix `/cc:` (Claude Code does t
 | `/cc:end N`      | tail_tokens = N  (e.g. `/cc:end 30000` keeps 30k tail verbatim) |
 | `/cc:both N`     | both head and tail = N |
 
+> **Budgets are tiktoken counts, not Claude tokens.** Windows are sized with tiktoken (`cl100k_base`); Claude's own tokenizer counts more — roughly **1.5–1.66×** on the code/tool-heavy transcripts typical of Claude Code (less on prose-heavy ones). So a budget of `N` preserves about `1.5–1.66×N` tokens of real context — e.g. `/cc:end 30000` lands around 45–50k real. Targeting a specific real size? Set `N` to ~0.6× of it. Percentage budgets (below) are unaffected: numerator and denominator use the same tokenizer, so the ratio cancels.
+
 ### Percentage budgets (N = percent of total convo tokens)
 
 | Command            | Effect |
@@ -142,7 +144,8 @@ Copy that into a new shell.
 
 ## What gets preserved vs. compressed
 
-- **Preserved verbatim:** all `text`, `tool_use`, `tool_result`, `thinking`, `image` blocks in the head and tail windows. `message.usage` is stripped (it leaks parent-session counts).
+- **Preserved verbatim:** all `text`, `tool_use`, `tool_result`, `image` blocks in the head and tail windows. `message.usage` is stripped (it leaks parent-session counts).
+- **Dropped:** `thinking` / `redacted_thinking` blocks (empty-text under Opus 4.8's default display — only a large opaque signature would remain, which is same-model replay-validation weight that can't be partially kept). Assistant entries that are *only* thinking are removed whole, so the fork carries real conversation instead of signature mass.
 - **Truncated:** `tool_result` blocks > `PRECOMPACT_MAX_BLOCK_TOKENS` (default 3000) and embedded file content in attachments. **Plain text blocks are never truncated.**
 - **Compressed:** middle entries are sent raw to the summarizer (no per-block truncation applied to the summarizer's input — only to the fork on disk).
 

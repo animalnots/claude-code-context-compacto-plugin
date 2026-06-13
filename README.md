@@ -32,6 +32,8 @@ That's it. Restart Claude Code if needed.
 
 Config lives at `~/.claude/precompact.conf` and is read fresh on every compact, in any session.
 
+> Budgets are **tiktoken** counts, not Claude tokens. Claude's tokenizer runs ~1.5–1.66× higher on code/tool-heavy sessions, so `/cc:begin 25000` and `/cc:end 25000` each preserve roughly 38–42k tokens of real context. Set the number to ~0.6× of a target real size. (Percentage budgets — `/cc:end-pct` etc. — are unaffected.)
+
 ### 2. Compact a session
 
 When your context gets full (or you just want to trim it), run:

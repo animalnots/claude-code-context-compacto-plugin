@@ -10,7 +10,10 @@ Original file is never mutated.
 Beyond selecting the head/tail windows by token budget, this also:
   - drops middle-zone `attachment` and `file-history-snapshot` entries
   - drops user entries that are pure `<local-command-stdout>` / `<local-command-caveat>` wrappers
-  - strips `image` and `thinking` blocks from preserved content
+  - drops assistant entries that are only `thinking` blocks, and strips
+    `thinking` / `redacted_thinking` blocks from any other preserved content
+    (empty-text under Opus 4.8 display defaults, their signatures are dead
+    weight across a compaction boundary; `image` blocks are kept)
   - caps individual text / tool_result / attachment-file blocks at MAX_BLOCK_TOKENS
   - strips `message.usage` (cached API token counts) and `toolUseResult` metadata
   - reassigns every UUID so Claude Code can't re-hydrate the fork from other session files
@@ -191,6 +194,28 @@ def _is_command_stdout_artifact(entry: Dict) -> bool:
     return False
 
 
+def _is_thinking_only(entry: Dict) -> bool:
+    """True for an assistant entry whose content is *only* thinking /
+    redacted_thinking blocks. Under Opus 4.8's default thinking display the
+    text of these blocks is empty, so all that survives is a large opaque
+    signature kept solely to replay-validate the turn on the same model — pure
+    weight across a compaction boundary. A thinking block can't be partially
+    kept (a blanked signature is a *modified* block the API rejects), so such
+    entries are dropped from the fork whole, mirroring native compaction.
+    Mixed entries (thinking + text/tool_use) are kept; `_strip_ephemeral`
+    removes just the thinking block from those.
+    """
+    if entry.get("type") != "assistant":
+        return False
+    c = entry.get("message", {}).get("content", "")
+    if not isinstance(c, list) or not c:
+        return False
+    return all(
+        isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking")
+        for b in c
+    )
+
+
 def _truncate_text(s: str, max_tokens: int = MAX_BLOCK_TOKENS) -> str:
     """Cap a string at max_tokens. Uses the active token counter; for non-tiktoken
     fallback it still errs safe by iteratively shrinking until the count fits.
@@ -257,16 +282,24 @@ def _strip_ephemeral(entry: Dict) -> Dict:
 
     if isinstance(c, list):
         new_c = []
-        any_truncated = False
+        content_changed = False
         for b in c:
+            if isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking"):
+                # Drop thinking blocks from preserved content: empty-text under
+                # Opus 4.8 display defaults, leaving only a large opaque
+                # signature that replay-validates on the same model — dead
+                # weight here. Can't blank the signature in place (modified
+                # block → API reject), so the whole block goes.
+                content_changed = True
+                continue
             if isinstance(b, dict):
                 truncated = _truncate_block(b)
                 if truncated is not b:
-                    any_truncated = True
+                    content_changed = True
                 new_c.append(truncated)
             else:
                 new_c.append(b)
-        if any_truncated:
+        if content_changed:
             new_msg = dict(msg)
             new_msg["content"] = new_c
             changed = True
@@ -363,7 +396,7 @@ def rewrite(orig_path: str, summary: str, projects_dir: str = None) -> str:
         u = e.get("uuid")
         if u in seen:
             continue
-        if _is_command_stdout_artifact(e):
+        if _is_command_stdout_artifact(e) or _is_thinking_only(e):
             continue
         seen.add(u)
         convo.append(e)

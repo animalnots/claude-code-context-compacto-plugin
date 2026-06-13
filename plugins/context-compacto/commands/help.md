@@ -7,10 +7,13 @@ Print ONLY the block below verbatim — no preamble, no commentary, no surroundi
 ```
 Precompact slash commands (all under the /cc: plugin namespace)
 
-Absolute token budgets (N = raw token count):
+Absolute token budgets (N = raw tiktoken count):
   /cc:begin N        set head-window           (e.g. /cc:begin 25000)
   /cc:end N          set tail-window           (e.g. /cc:end 30000)
   /cc:both N         set both head and tail    (e.g. /cc:both 15000)
+  N is a tiktoken count; Claude's own tokenizer runs ~1.5-1.66x higher on
+  code/tool-heavy sessions, so N preserves ~1.5-1.66xN tokens of real context
+  (set N to ~0.6x of a target real size). Percentage budgets are unaffected.
 
 Percentage budgets (N = percent of total convo tokens, head_pct + tail_pct ≤ 100):
   /cc:begin-pct N    set head as %             (e.g. /cc:begin-pct 10  → head_pct=10)

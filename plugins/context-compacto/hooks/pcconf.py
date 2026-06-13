@@ -118,10 +118,13 @@ def _reset():
 
 HELP = """Precompact slash commands (all under the /cc: plugin namespace)
 
-Absolute token budgets (N = raw token count):
+Absolute token budgets (N = raw tiktoken count):
   /cc:begin N        set head-window           (e.g. /cc:begin 25000  -> head_tokens=25000)
   /cc:end N          set tail-window           (e.g. /cc:end 30000    -> tail_tokens=30000)
   /cc:both N         set both head and tail    (e.g. /cc:both 15000)
+  N is a tiktoken count; Claude's own tokenizer runs ~1.5-1.66x higher on
+  code/tool-heavy sessions, so N preserves ~1.5-1.66xN tokens of real context
+  (set N to ~0.6x of a target real size). Percentage budgets are unaffected.
 
 Percentage budgets (N = percent of total convo tokens, head_pct + tail_pct ≤ 100):
   /cc:begin-pct N    set head as %             (e.g. /cc:begin-pct 10  -> head_pct=10)
@@ -171,19 +174,19 @@ def main():
 
     if cmd == "begin":
         if arg is None:
-            sys.stdout.write("usage: /cc:begin N  (raw token count, e.g. /cc:begin 30000 keeps 30000 head tokens)\n")
+            sys.stdout.write("usage: /cc:begin N  (N = tiktoken count; real context ~1.5-1.66x N. e.g. /cc:begin 30000)\n")
             return
         _set("head_tokens", str(int(arg)))
         _clear("head_pct")
     elif cmd == "end":
         if arg is None:
-            sys.stdout.write("usage: /cc:end N  (raw token count, e.g. /cc:end 30000 keeps 30000 tail tokens)\n")
+            sys.stdout.write("usage: /cc:end N  (N = tiktoken count; real context ~1.5-1.66x N. e.g. /cc:end 30000)\n")
             return
         _set("tail_tokens", str(int(arg)))
         _clear("tail_pct")
     elif cmd == "both":
         if arg is None:
-            sys.stdout.write("usage: /cc:both N  (raw token count, e.g. /cc:both 15000 sets head+tail to 15000 each)\n")
+            sys.stdout.write("usage: /cc:both N  (N = tiktoken count; real context ~1.5-1.66x N. e.g. /cc:both 15000 sets head+tail to 15000 each)\n")
             return
         _set("head_tokens", str(int(arg)))
         _set("tail_tokens", str(int(arg)))

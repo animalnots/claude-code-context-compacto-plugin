@@ -163,7 +163,8 @@ seen = set()
 convo = []
 for e in convo_all:
     u = e.get("uuid")
-    if u in seen or rewrite_transcript._is_command_stdout_artifact(e):
+    if (u in seen or rewrite_transcript._is_command_stdout_artifact(e)
+            or rewrite_transcript._is_thinking_only(e)):
         continue
     seen.add(u)
     convo.append(e)
