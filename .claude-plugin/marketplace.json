@@ -8,7 +8,7 @@
       "name": "cc",
       "source": "./plugins/context-compacto",
       "description": "Smarter /compact: keeps head and tail of your session verbatim, summarizes only the middle, writes a resumable forked transcript. No more context black hole after compaction.",
-      "version": "1.3.0",
+      "version": "1.4.0",
       "author": {
         "name": "Animalnots"
       },
