@@ -56,6 +56,8 @@ All commands are namespaced under the plugin's prefix `/cc:` (Claude Code does t
 | `/cc:model1m ID`   | 1M-context summarizer, used when the middle is bigger (e.g. `opus[1m]`) |
 | `/cc:model ID`     | alias for `/cc:model200k` |
 | `/cc:autoresume on\|off` | arm/disarm tmux auto-resume — a daemon types `/resume <fork>` into your pane after each compact (default **off**; see [Auto-resume](#auto-resume-optional-off-by-default)) |
+| `/cc:autocompact N [msgs\|ctx]` | auto-`/compact` this pane once it reaches N tokens (default **off**; see [Autonomous loop](#autonomous-loop-auto-compact--continue--advanced-unattended)) |
+| `/cc:continue MSG\|off` | after an auto-triggered compaction resumes, auto-send MSG (e.g. `continue`) so the task keeps going (default **off**) |
 | `/cc:show`        | print current config |
 | `/cc:reset`       | delete config (revert to defaults) |
 | `/cc:help`        | inline help |
@@ -162,6 +164,63 @@ Automates that one keystroke. When armed, after every compaction a small daemon 
 >
 > Assumes a single default tmux server (pane ids are unique per server).
 
+## Autonomous loop (auto-compact + continue) — advanced, unattended
+
+Chains everything above into a hands-off loop: **compact at a token threshold → auto-resume → auto-send a message** so a long task keeps running across compaction boundaries with no one at the keyboard. This removes the human from the loop by design — read the warning before arming it.
+
+**Requires the auto-resume daemon (above) plus one extra piece: a statusline export** so the daemon can read your live context size. Add these lines to your Claude Code statusline command (the script behind `statusLine` in `~/.claude/settings.json`), right after it computes the current token count:
+
+```bash
+# --- context-compacto: export live context size for the auto-compact watcher ---
+if [ -n "${TMUX_PANE:-}" ]; then
+    _cc_sig="$HOME/.claude/compacto-signals"
+    if mkdir -p "$_cc_sig" 2>/dev/null; then
+        _cc_key="${TMUX_PANE//[^a-zA-Z0-9]/}"
+        printf '%s\t%s\t%s\n' "$TMUX_PANE" "$CTX" "$MSG" > "$_cc_sig/${_cc_key}.ctx.tmp" 2>/dev/null \
+            && mv -f "$_cc_sig/${_cc_key}.ctx.tmp" "$_cc_sig/${_cc_key}.ctx" 2>/dev/null
+    fi
+fi
+```
+
+`$CTX` = total context tokens (`.context_window.total_input_tokens` from the JSON Claude Code pipes to the statusline); `$MSG` = whatever "message tokens" figure you display. No export → the loop has nothing to read and never triggers.
+
+**Arm it (both off by default):**
+
+```
+/cc:autocompact 180000        # compact when msgs (the statusline number) reaches 180k
+/cc:autocompact 150000 ctx    # ...or trigger on raw context tokens instead of msgs
+/cc:continue continue         # after each AUTO compaction resumes, send "continue"
+/cc:autocompact off           # disarm the trigger
+/cc:continue off              # disarm the auto-send
+```
+
+Run the **same daemon** as auto-resume — it does all three jobs.
+
+**⚠ This is UNBOUNDED.** compact → resume → "continue" → context grows → compact … repeats with no cap and no human in it, until you **stop the daemon (`Ctrl-C`)** or run `/cc:autocompact off`. It spends real tokens the whole time (your Max weekly allowance, or API credits). There is deliberately no auto-stop — *you* are the bound.
+
+**Only auto-triggered compactions continue.** A manual `/compact` you run to inspect still auto-resumes but does **not** auto-send the message (the daemon only continues compactions it started).
+
+**The fragile part — idle detection.** The daemon only fires `/compact` / `continue` when the pane looks idle, judged by the *absence* of the "generating" indicator (`esc to interrupt`) in the pane text. If your Claude Code shows a different string while working, verify and tune it:
+
+```bash
+# while Claude is actively generating in pane %N, this SHOULD print a match:
+tmux capture-pane -p -t %N | grep -i 'esc to interrupt'
+# if it doesn't, point the daemon at the string your build shows:
+COMPACTO_BUSY_REGEX='your busy text' /path/to/compacto-resume-daemon.sh &
+```
+
+**Daemon env knobs:**
+
+```
+COMPACTO_TMUX=tmux                       # tmux command (e.g. "tmux -L socket")
+COMPACTO_BUSY_REGEX='esc to interrupt'   # "pane is generating" marker (idle = absent)
+COMPACTO_COMPACT_COOLDOWN=300            # secs before a stuck in-flight compaction is retried (> the 240s summarizer timeout)
+COMPACTO_CONTINUE_SETTLE=3               # secs to let a resume render before typing the continue message
+COMPACTO_POLL_SECS=1                     # poll interval
+```
+
+Config keys (in `~/.claude/precompact.conf`, read live on every poll): `auto_compact_at`, `auto_compact_metric` (`msgs` | `ctx`), `resume_continue`.
+
 ## Requirements
 
 - **Python 3.8+** on PATH (`python` resolvable). On Windows, use the [python.org installer](https://www.python.org/downloads/) which adds `python` to PATH; on macOS/Linux, install via your package manager.
@@ -183,11 +242,11 @@ plugins/context-compacto/
 ├── hooks/
 │   ├── hooks.json                  PreCompact registration (auto + manual)
 │   ├── precompact.py               hook entry: writes preview + fork (+ auto-resume signal)
-│   ├── pcconf.py                   /cc:begin /cc:end /cc:both /cc:model /cc:autoresume /cc:show /cc:reset config helper
+│   ├── pcconf.py                   /cc:begin /cc:end /cc:both /cc:model /cc:autoresume /cc:autocompact /cc:continue /cc:show /cc:reset config helper
 │   ├── rewrite_transcript.py       JSONL surgery: head + synth + tail with parentUuid relinking
-│   └── compacto-resume-daemon.sh   optional watcher: types /resume <fork> into the right tmux pane
+│   └── compacto-resume-daemon.sh   optional watcher: auto-resume + threshold auto-compact + post-resume continue
 ├── commands/                       slash commands
-│   ├── begin.md end.md both.md begin-pct.md end-pct.md both-pct.md model.md autoresume.md show.md reset.md help.md
+│   ├── begin.md end.md both.md begin-pct.md end-pct.md both-pct.md model.md autoresume.md autocompact.md continue.md show.md reset.md help.md
 └── README.md
 ```
 

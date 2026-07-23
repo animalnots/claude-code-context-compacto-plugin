@@ -18,6 +18,8 @@ Usage:
     model1m ID   1M-context summarizer model
     model MODEL  alias for model200k
     autoresume on|off  arm/disarm the tmux auto-resume signal (default off)
+    autocompact N [msgs|ctx]  auto-/compact a pane once it reaches N tokens (default off)
+    continue MSG|off  message auto-sent after an auto-compacted resume, e.g. continue (default off)
     show         print the current config (or defaults note)
     reset        delete the config file
     help         print usage
@@ -108,7 +110,7 @@ def _show():
     if CONF.exists():
         sys.stdout.write(CONF.read_text(encoding="utf-8"))
     else:
-        print("(defaults: head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]  auto_resume=off)")
+        print("(defaults: head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]  auto_resume=off  auto_compact_at=off  resume_continue=off)")
 
 
 def _reset():
@@ -137,6 +139,8 @@ Other (the middle is summarized by a model picked automatically from its size):
   /cc:model1m ID     model when the middle needs 1M context        (e.g. /cc:model1m opus[1m])
   /cc:model ID       alias for /cc:model200k
   /cc:autoresume on|off  after each compact, a daemon types /resume <fork> into your tmux pane (default off)
+  /cc:autocompact N [msgs|ctx]  auto-/compact this pane at N tokens; needs the daemon + statusline export (default off)
+  /cc:continue MSG|off  after an auto-compacted resume, auto-send MSG (e.g. continue) so the task keeps going (default off)
   /cc:show           print current config
   /cc:reset          clear config (defaults restored)
   /cc:help           this help
@@ -150,6 +154,12 @@ Auto-resume: /cc:autoresume on only ARMS the signal. It also requires (1) the
   message's /resume line is the manual fallback. Keyed on $TMUX_PANE, so any
   number of parallel sessions each resume their own window.
 
+Autonomous loop (UNATTENDED, no cap): /cc:autocompact N + /cc:continue MSG make a
+  pane compact at N tokens, auto-resume, then auto-send MSG -- looping with no
+  human in it until you stop the daemon (Ctrl-C). Metric is msgs (the statusline
+  number) unless you pass ctx. Needs the statusline context export (see README).
+  Watch your usage: it runs until stopped.
+
 Mutex per window (last command wins): /cc:begin clears head_pct; /cc:begin-pct clears head_tokens.
   Mixing modes ACROSS windows is fine (e.g. head_tokens=20000 + tail_pct=15).
 
@@ -157,7 +167,7 @@ Scope: ~/.claude/precompact.conf is GLOBAL. Edits take effect on the NEXT compac
   in any session — current, other running sessions, or future ones. No per-session
   snapshot. Env vars (if set) override the file for that shell.
 
-Defaults (no config, no env): head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]  auto_resume=off
+Defaults (no config, no env): head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]  auto_resume=off  auto_compact_at=off  resume_continue=off
 Config file: ~/.claude/precompact.conf
 
 Precedence per window (head and tail resolved independently):
@@ -242,6 +252,30 @@ def main():
         else:
             sys.stdout.write("usage: /cc:autoresume on|off\n")
             return
+    elif cmd == "autocompact":
+        val = (arg or "").strip().lower()
+        if val in ("off", "0", ""):
+            _clear("auto_compact_at")
+        else:
+            try:
+                n = int(val)
+            except ValueError:
+                sys.stdout.write("usage: /cc:autocompact N [msgs|ctx] | off   (N = token threshold)\n")
+                return
+            if n <= 0:
+                _clear("auto_compact_at")
+            else:
+                _set("auto_compact_at", str(n))
+                metric = (sys.argv[3] if len(sys.argv) > 3 else "").strip().lower()
+                if metric in ("msgs", "ctx"):
+                    _set("auto_compact_metric", metric)
+    elif cmd == "continue":
+        # Message may be multiple words; empty or "off" disables.
+        msg = " ".join(sys.argv[2:]).strip()
+        if msg.lower() in ("off", ""):
+            _clear("resume_continue")
+        else:
+            _set("resume_continue", msg)
     elif cmd == "show":
         _show()
         return
@@ -252,7 +286,7 @@ def main():
         sys.stdout.write(HELP)
         return
     else:
-        sys.stderr.write("usage: pcconf.py begin|end|both|begin-pct|end-pct|both-pct N | model|model200k|model1m MODEL | autoresume on|off | show | reset | help\n")
+        sys.stderr.write("usage: pcconf.py begin|end|both|begin-pct|end-pct|both-pct N | model|model200k|model1m MODEL | autoresume on|off | autocompact N [msgs|ctx] | continue MSG|off | show | reset | help\n")
         sys.exit(1)
 
     # mutating commands fall through and print the resulting config

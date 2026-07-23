@@ -73,6 +73,17 @@ Don't want to type `/resume` yourself every time? Arm auto-resume and a small da
 
 Run Claude Code inside **tmux** and each compaction now types `/resume <fork-id>` into that pane automatically. It's parallel-safe: signals are keyed on the tmux pane id, so multiple sessions compacting at once each resume their own window. Turn it off with `/cc:autoresume off`, or just don't run the daemon. Full details in the [plugin README](plugins/context-compacto/README.md#auto-resume-optional-off-by-default).
 
+### 5. Autonomous loop (advanced, unattended)
+
+Go further and let a long task run *itself* across compactions: **auto-compact at a token threshold → auto-resume → auto-send "continue"**. With the daemon running:
+
+```
+/cc:autocompact 180000     # compact this pane once it reaches 180k tokens
+/cc:continue continue      # after each auto-compaction resumes, send "continue"
+```
+
+**⚠ Unbounded and hands-off** — compact → resume → continue → repeat, spending tokens with no human and no cap until you stop the daemon (`Ctrl-C`) or run `/cc:autocompact off`. It also needs a small export added to your statusline so the daemon can read the live context size. Setup, safeguards, and idle-detection tuning are in the [plugin README](plugins/context-compacto/README.md#autonomous-loop-auto-compact--continue--advanced-unattended).
+
 ## Requirements
 
 - **Python 3.8+** on PATH (the hook is pure Python; no extra deps required, optional `pip install tiktoken` for accurate token counting).
@@ -109,7 +120,7 @@ Then re-run `/plugin install` if there are version changes.
 │       │   ├── pcconf.py               config helper for slash commands
 │       │   ├── rewrite_transcript.py   JSONL fork writer
 │       │   └── compacto-resume-daemon.sh  optional tmux auto-resume watcher
-│       ├── commands/                   /cc:begin /cc:end /cc:both /cc:begin-pct /cc:end-pct /cc:both-pct /cc:model /cc:autoresume /cc:show /cc:reset /cc:help
+│       ├── commands/                   /cc:begin /cc:end /cc:both /cc:begin-pct /cc:end-pct /cc:both-pct /cc:model /cc:autoresume /cc:autocompact /cc:continue /cc:show /cc:reset /cc:help
 │       └── README.md                   plugin docs (full usage + config)
 └── README.md                           this file
 ```
