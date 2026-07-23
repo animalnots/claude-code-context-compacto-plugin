@@ -35,13 +35,21 @@ Config file (~/.claude/precompact.conf):
   model=<id>               legacy single model (alias for model_200k)
   std_ctx_limit=<N>        max middle tokens for the 200k slot (default 180000)
   long_ctx_limit=<N>       max middle tokens sent to the 1M slot (default 900000)
+  auto_resume=<0|1>        arm the tmux auto-resume signal (default 0/off)
+
+Auto-resume (opt-in): when auto_resume is on AND the hook runs inside tmux, it
+also drops a per-pane signal file at ~/.claude/compacto-signals/<pane>.resume so
+the companion compacto-resume-daemon.sh can type `/resume <new-sid>` into this
+exact pane. Keyed on $TMUX_PANE, so parallel sessions never cross-resume. Off by
+default and inert unless the daemon is running; the block message is always the
+manual fallback.
 
 Env vars (all optional, override config file):
   PRECOMPACT_HEAD_TOKENS, PRECOMPACT_TAIL_TOKENS,
   PRECOMPACT_HEAD_PCT, PRECOMPACT_TAIL_PCT,
   PRECOMPACT_WINDOW_TOKENS, PRECOMPACT_MAX_BLOCK_TOKENS,
   PRECOMPACT_MODEL_200K, PRECOMPACT_MODEL_1M, PRECOMPACT_MODEL (legacy),
-  PRECOMPACT_STD_CTX_LIMIT, PRECOMPACT_LONG_CTX_LIMIT
+  PRECOMPACT_STD_CTX_LIMIT, PRECOMPACT_LONG_CTX_LIMIT, PRECOMPACT_AUTO_RESUME
 
 Precedence per setting: env var > config file > built-in default.
 """
@@ -78,6 +86,7 @@ _CONF_KEYS = {
     "model_1m":         "PRECOMPACT_MODEL_1M",
     "std_ctx_limit":    "PRECOMPACT_STD_CTX_LIMIT",
     "long_ctx_limit":   "PRECOMPACT_LONG_CTX_LIMIT",
+    "auto_resume":      "PRECOMPACT_AUTO_RESUME",
 }
 if PCCONF.exists():
     for line in PCCONF.read_text(encoding="utf-8").splitlines():
@@ -106,6 +115,18 @@ model_1m = os.environ.get("PRECOMPACT_MODEL_1M") or "opus[1m]"
 # input we cap at LONG_CTX_LIMIT to stay under the 1M window.
 STD_CTX_LIMIT = int(os.environ.get("PRECOMPACT_STD_CTX_LIMIT", "180000"))
 LONG_CTX_LIMIT = int(os.environ.get("PRECOMPACT_LONG_CTX_LIMIT", "900000"))
+
+
+def _truthy(v):
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Auto-resume (opt-in). When on AND we're inside a tmux pane, section 9b drops a
+# per-pane signal the resume daemon watches. Keyed on $TMUX_PANE so N parallel
+# sessions each resume their own window and never cross-wire.
+AUTO_RESUME = _truthy(os.environ.get("PRECOMPACT_AUTO_RESUME"))
+TMUX_PANE = os.environ.get("TMUX_PANE", "")
+SIGNAL_DIR = pathlib.Path.home() / ".claude" / "compacto-signals"
 
 cwd_dir = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
 out_dir = pathlib.Path(cwd_dir) / ".claude" / "summaries"
@@ -455,6 +476,30 @@ elif summary is None:
     fork_error = "no summary, fork skipped"
 
 
+# ---- 9b. Arm auto-resume (opt-in, tmux-only) -----------------------------
+# Drop a per-pane signal file the resume daemon polls. Best-effort: a failed
+# signal must never break compaction, and the reason string below is always the
+# manual fallback. Written atomically (temp + os.replace) so the daemon can't
+# read a half-written id.
+autoresume_note = None
+if fork_id and AUTO_RESUME:
+    if TMUX_PANE:
+        try:
+            SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
+            pane_key = "".join(c for c in TMUX_PANE if c.isalnum()) or "pane"
+            sig = SIGNAL_DIR / f"{pane_key}.resume"
+            tmp = SIGNAL_DIR / f"{pane_key}.resume.tmp"
+            # Line is  <exact-pane-id>\t<fork-id>  — the daemon targets the pane
+            # verbatim and never has to reconstruct it from the filename.
+            tmp.write_text(f"{TMUX_PANE}\t{fork_id}\n", encoding="utf-8")
+            os.replace(tmp, sig)
+            autoresume_note = f"Auto-resume armed for tmux pane {TMUX_PANE} (needs compacto-resume-daemon.sh running)."
+        except Exception as e:
+            autoresume_note = f"Auto-resume signal failed ({type(e).__name__}: {e}); resume manually."
+    else:
+        autoresume_note = "auto_resume is on but $TMUX_PANE is unset (not inside tmux); resume manually."
+
+
 # ---- 10. Emit hook response ---------------------------------------------
 reason_parts = [f"precompact blocked ({trigger}); preview at {preview}."]
 if model_used:
@@ -463,6 +508,8 @@ if fork_id:
     reason_parts.append(f"Compressed fork written. Resume in this chat with:  /resume {fork_id}   (or  claude --resume {fork_id}  from a new shell).")
 elif fork_error:
     reason_parts.append(f"Fork not created: {fork_error}")
+if autoresume_note:
+    reason_parts.append(autoresume_note)
 if summary_error:
     reason_parts.append(f"Summary error: {summary_error} (middle kept raw in preview).")
 

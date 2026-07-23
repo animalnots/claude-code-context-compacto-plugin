@@ -62,11 +62,23 @@ You're now in the forked session with head + summary + tail loaded. The original
 
 > Tip: a human-readable preview of every fork is also written to `<project>/.claude/summaries/<sid>-<ts>.md` so you can inspect what the summarizer produced before resuming.
 
+### 4. Auto-resume (optional, off by default)
+
+Don't want to type `/resume` yourself every time? Arm auto-resume and a small daemon does that one keystroke for you after each compaction — a long session compacts and continues on its own while you stay at the keyboard reviewing. Two switches, both off by default:
+
+```
+/cc:autoresume on                                             # arm it
+"${CLAUDE_PLUGIN_ROOT}/hooks/compacto-resume-daemon.sh" &     # run the watcher once (needs tmux)
+```
+
+Run Claude Code inside **tmux** and each compaction now types `/resume <fork-id>` into that pane automatically. It's parallel-safe: signals are keyed on the tmux pane id, so multiple sessions compacting at once each resume their own window. Turn it off with `/cc:autoresume off`, or just don't run the daemon. Full details in the [plugin README](plugins/context-compacto/README.md#auto-resume-optional-off-by-default).
+
 ## Requirements
 
 - **Python 3.8+** on PATH (the hook is pure Python; no extra deps required, optional `pip install tiktoken` for accurate token counting).
 - **`claude` CLI** on PATH — the summarizer calls `claude -p` with `--system-prompt` to compress the middle.
-- Tested on macOS / Linux. Windows works under Git Bash (which Claude Code uses for hook shell-exec on Windows). Pure cmd / PowerShell support depends on whether your Claude Code build resolves `python` and `${CLAUDE_PLUGIN_ROOT}` correctly — file an issue if not.
+- **`tmux`** — only for optional auto-resume (§4). Everything else works without it.
+- Tested on macOS / Linux. Windows works under Git Bash (which Claude Code uses for hook shell-exec on Windows). Pure cmd / PowerShell support depends on whether your Claude Code build resolves `python` and `${CLAUDE_PLUGIN_ROOT}` correctly — file an issue if not. Auto-resume's daemon is a bash script and expects tmux, so it's macOS/Linux/Git-Bash.
 
 ## Update the plugin
 
@@ -95,8 +107,9 @@ Then re-run `/plugin install` if there are version changes.
 │       │   ├── hooks.json              PreCompact registration
 │       │   ├── precompact.py           hook entry point
 │       │   ├── pcconf.py               config helper for slash commands
-│       │   └── rewrite_transcript.py   JSONL fork writer
-│       ├── commands/                   /cc:begin /cc:end /cc:both /cc:begin-pct /cc:end-pct /cc:both-pct /cc:model /cc:show /cc:reset /cc:help
+│       │   ├── rewrite_transcript.py   JSONL fork writer
+│       │   └── compacto-resume-daemon.sh  optional tmux auto-resume watcher
+│       ├── commands/                   /cc:begin /cc:end /cc:both /cc:begin-pct /cc:end-pct /cc:both-pct /cc:model /cc:autoresume /cc:show /cc:reset /cc:help
 │       └── README.md                   plugin docs (full usage + config)
 └── README.md                           this file
 ```

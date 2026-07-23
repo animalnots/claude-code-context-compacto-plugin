@@ -17,6 +17,7 @@ Usage:
     model200k ID standard-context summarizer model (clears legacy `model`)
     model1m ID   1M-context summarizer model
     model MODEL  alias for model200k
+    autoresume on|off  arm/disarm the tmux auto-resume signal (default off)
     show         print the current config (or defaults note)
     reset        delete the config file
     help         print usage
@@ -107,7 +108,7 @@ def _show():
     if CONF.exists():
         sys.stdout.write(CONF.read_text(encoding="utf-8"))
     else:
-        print("(defaults: head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m])")
+        print("(defaults: head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]  auto_resume=off)")
 
 
 def _reset():
@@ -135,12 +136,19 @@ Other (the middle is summarized by a model picked automatically from its size):
   /cc:model200k ID   model when the middle fits standard context  (e.g. /cc:model200k sonnet)
   /cc:model1m ID     model when the middle needs 1M context        (e.g. /cc:model1m opus[1m])
   /cc:model ID       alias for /cc:model200k
+  /cc:autoresume on|off  after each compact, a daemon types /resume <fork> into your tmux pane (default off)
   /cc:show           print current config
   /cc:reset          clear config (defaults restored)
   /cc:help           this help
 
 Note: [1m] models need the long-context beta / usage credits. On Claude Max,
   opus[1m] works; sonnet[1m] needs usage credits; standard models need neither.
+
+Auto-resume: /cc:autoresume on only ARMS the signal. It also requires (1) the
+  session to run inside tmux and (2) compacto-resume-daemon.sh running once in
+  the background. Off or daemon-not-running -> nothing auto-resumes; the block
+  message's /resume line is the manual fallback. Keyed on $TMUX_PANE, so any
+  number of parallel sessions each resume their own window.
 
 Mutex per window (last command wins): /cc:begin clears head_pct; /cc:begin-pct clears head_tokens.
   Mixing modes ACROSS windows is fine (e.g. head_tokens=20000 + tail_pct=15).
@@ -149,7 +157,7 @@ Scope: ~/.claude/precompact.conf is GLOBAL. Edits take effect on the NEXT compac
   in any session — current, other running sessions, or future ones. No per-session
   snapshot. Env vars (if set) override the file for that shell.
 
-Defaults (no config, no env): head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]
+Defaults (no config, no env): head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]  auto_resume=off
 Config file: ~/.claude/precompact.conf
 
 Precedence per window (head and tail resolved independently):
@@ -224,6 +232,16 @@ def main():
         _clear("model")
     elif cmd == "model1m":
         _set("model_1m", arg if arg is not None else "opus[1m]")
+    elif cmd == "autoresume":
+        val = (arg or "").strip().lower()
+        if val in ("on", "1", "true", "yes"):
+            _set("auto_resume", "1")
+        elif val in ("off", "0", "false", "no", ""):
+            # Default is off, represented by the key being absent.
+            _clear("auto_resume")
+        else:
+            sys.stdout.write("usage: /cc:autoresume on|off\n")
+            return
     elif cmd == "show":
         _show()
         return
@@ -234,7 +252,7 @@ def main():
         sys.stdout.write(HELP)
         return
     else:
-        sys.stderr.write("usage: pcconf.py begin|end|both|begin-pct|end-pct|both-pct N | model|model200k|model1m MODEL | show | reset | help\n")
+        sys.stderr.write("usage: pcconf.py begin|end|both|begin-pct|end-pct|both-pct N | model|model200k|model1m MODEL | autoresume on|off | show | reset | help\n")
         sys.exit(1)
 
     # mutating commands fall through and print the resulting config

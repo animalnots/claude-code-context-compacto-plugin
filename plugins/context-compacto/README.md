@@ -55,6 +55,7 @@ All commands are namespaced under the plugin's prefix `/cc:` (Claude Code does t
 | `/cc:model200k ID` | standard-context summarizer, used when the middle fits ≤200k (e.g. `sonnet`) |
 | `/cc:model1m ID`   | 1M-context summarizer, used when the middle is bigger (e.g. `opus[1m]`) |
 | `/cc:model ID`     | alias for `/cc:model200k` |
+| `/cc:autoresume on\|off` | arm/disarm tmux auto-resume — a daemon types `/resume <fork>` into your pane after each compact (default **off**; see [Auto-resume](#auto-resume-optional-off-by-default)) |
 | `/cc:show`        | print current config |
 | `/cc:reset`       | delete config (revert to defaults) |
 | `/cc:help`        | inline help |
@@ -124,17 +125,42 @@ PRECOMPACT_MODEL_1M=opus[1m]
 PRECOMPACT_MAX_BLOCK_TOKENS=3000      # truncation cap for tool_result / attachment file content
 PRECOMPACT_STD_CTX_LIMIT=180000       # max middle tokens for the 200k slot before switching to 1M
 PRECOMPACT_LONG_CTX_LIMIT=900000      # max middle tokens sent to the 1M slot
+PRECOMPACT_AUTO_RESUME=1              # arm tmux auto-resume (default off; see Auto-resume)
 ```
 
 ## Resume after compaction
 
-The hook prints a JSON response that includes:
+The hook's block message prints the fork's session id:
 
 ```
-Compressed fork written. Resume with:  claude --resume <new-sid>
+Compressed fork written. Resume in this chat with:  /resume <new-sid>   (or  claude --resume <new-sid>  from a new shell).
 ```
 
-Copy that into a new shell.
+`/resume <new-sid>` swaps your current chat to the fork in place — no `/exit`, no new shell. See the top-level README for the picker fallback (forks are titled `compact MM-DD HH:MM`).
+
+## Auto-resume (optional, off by default)
+
+Automates that one keystroke. When armed, after every compaction a small daemon types `/resume <new-sid>` into your terminal for you, so a long session compacts and continues on its own while you keep working — you're still a human at the keyboard reviewing everything; only the mechanical resume is automated.
+
+**It is opt-in on two independent switches — with either one untouched, nothing auto-resumes and the plugin behaves exactly as before:**
+
+1. **Arm it:** `/cc:autoresume on` (writes `auto_resume=1`). Off by default.
+2. **Run the daemon once:** `"${CLAUDE_PLUGIN_ROOT}/hooks/compacto-resume-daemon.sh" &` (or give it its own tmux pane). Nothing auto-resumes unless it's running.
+
+**Requires tmux.** The hook only arms a resume when it runs inside a tmux pane, because the daemon drives the resume by sending keystrokes to that pane. Outside tmux, `auto_resume=on` is inert and the block message is your manual fallback.
+
+**How it stays parallel-safe.** On each compaction the hook drops a signal file at `~/.claude/compacto-signals/<pane>.resume` containing `<tmux-pane-id>\t<fork-id>`. The key is `$TMUX_PANE`, which is globally unique on the tmux server, so N sessions compacting at once each get their own signal and the daemon resumes each fork into *its own* window — session A never lands in session B's chat. One daemon serves every pane.
+
+```
+/cc:autoresume on                                             # arm (default off)
+"${CLAUDE_PLUGIN_ROOT}/hooks/compacto-resume-daemon.sh" &     # run once, serves all panes
+# ... work in one or more tmux panes; each compaction now self-resumes ...
+/cc:autoresume off                                            # disarm anytime
+```
+
+> Timing: a compaction returns you to an idle prompt, which is when the daemon types `/resume` — safe. If you manually `/compact` with half a line already typed, the injected `/resume` can interleave with it; v1 doesn't guard that edge.
+>
+> Assumes a single default tmux server (pane ids are unique per server).
 
 ## Requirements
 
@@ -156,11 +182,12 @@ plugins/context-compacto/
 ├── .claude-plugin/plugin.json
 ├── hooks/
 │   ├── hooks.json                  PreCompact registration (auto + manual)
-│   ├── precompact.py               hook entry: writes preview + fork
-│   ├── pcconf.py                   /cc:begin /cc:end /cc:both /cc:model /cc:show /cc:reset config helper
-│   └── rewrite_transcript.py       JSONL surgery: head + synth + tail with parentUuid relinking
+│   ├── precompact.py               hook entry: writes preview + fork (+ auto-resume signal)
+│   ├── pcconf.py                   /cc:begin /cc:end /cc:both /cc:model /cc:autoresume /cc:show /cc:reset config helper
+│   ├── rewrite_transcript.py       JSONL surgery: head + synth + tail with parentUuid relinking
+│   └── compacto-resume-daemon.sh   optional watcher: types /resume <fork> into the right tmux pane
 ├── commands/                       slash commands
-│   ├── begin.md end.md both.md begin-pct.md end-pct.md both-pct.md model.md show.md reset.md help.md
+│   ├── begin.md end.md both.md begin-pct.md end-pct.md both-pct.md model.md autoresume.md show.md reset.md help.md
 └── README.md
 ```
 
