@@ -110,7 +110,30 @@ def _show():
     if CONF.exists():
         sys.stdout.write(CONF.read_text(encoding="utf-8"))
     else:
-        print("(defaults: head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]  auto_resume=off  auto_compact_at=off  resume_continue=off)")
+        print("(defaults: head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m])")
+    # These three are "off" by being ABSENT from the file, so dumping the file
+    # alone can't tell "off" from "no such setting". Always spell them out.
+    conf = _read_conf()
+    print("automation:  auto_resume={}  auto_compact_at={} ({})  resume_continue={}".format(
+        "on" if conf.get("auto_resume") else "off",
+        conf.get("auto_compact_at") or "off",
+        conf.get("auto_compact_metric") or "msgs",
+        conf.get("resume_continue") or "off",
+    ))
+
+
+def _report_state(key, usage, extra=None):
+    """Bare command → report current state + usage, and change nothing.
+
+    Treating a missing argument as "off" meant a bare word silently disarmed an
+    automation, and since off is stored as an absent key, the config printed
+    afterwards showed no trace of it either.
+    """
+    cur = _read_conf().get(key)
+    print("{} is {}".format(key, "off" if not cur else ("on" if cur == "1" else cur)))
+    if extra:
+        print(extra)
+    print(usage)
 
 
 def _reset():
@@ -144,6 +167,9 @@ Other (the middle is summarized by a model picked automatically from its size):
   /cc:show           print current config
   /cc:reset          clear config (defaults restored)
   /cc:help           this help
+
+The three automation commands with NO argument report what they're set to and
+  change nothing -- /cc:autoresume, /cc:autocompact, /cc:continue.
 
 Note: [1m] models need the long-context beta / usage credits. On Claude Max,
   opus[1m] works; sonnet[1m] needs usage credits; standard models need neither.
@@ -244,9 +270,12 @@ def main():
         _set("model_1m", arg if arg is not None else "opus[1m]")
     elif cmd == "autoresume":
         val = (arg or "").strip().lower()
+        if not val:
+            _report_state("auto_resume", "usage: /cc:autoresume on|off")
+            return
         if val in ("on", "1", "true", "yes"):
             _set("auto_resume", "1")
-        elif val in ("off", "0", "false", "no", ""):
+        elif val in ("off", "0", "false", "no"):
             # Default is off, represented by the key being absent.
             _clear("auto_resume")
         else:
@@ -254,7 +283,15 @@ def main():
             return
     elif cmd == "autocompact":
         val = (arg or "").strip().lower()
-        if val in ("off", "0", ""):
+        if not val:
+            _report_state(
+                "auto_compact_at",
+                "usage: /cc:autocompact N [msgs|ctx] | off   (N = token threshold)",
+                extra="auto_compact_metric is {}".format(
+                    _read_conf().get("auto_compact_metric") or "msgs"),
+            )
+            return
+        if val in ("off", "0"):
             _clear("auto_compact_at")
         else:
             try:
@@ -270,9 +307,13 @@ def main():
                 if metric in ("msgs", "ctx"):
                     _set("auto_compact_metric", metric)
     elif cmd == "continue":
-        # Message may be multiple words; empty or "off" disables.
+        # Message may be multiple words; "off" disables.
         msg = " ".join(sys.argv[2:]).strip()
-        if msg.lower() in ("off", ""):
+        if not msg:
+            _report_state("resume_continue",
+                          "usage: /cc:continue MSG | off   (e.g. /cc:continue continue)")
+            return
+        if msg.lower() == "off":
             _clear("resume_continue")
         else:
             _set("resume_continue", msg)
