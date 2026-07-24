@@ -49,7 +49,8 @@ Env vars (all optional, override config file):
   PRECOMPACT_HEAD_PCT, PRECOMPACT_TAIL_PCT,
   PRECOMPACT_WINDOW_TOKENS, PRECOMPACT_MAX_BLOCK_TOKENS,
   PRECOMPACT_MODEL_200K, PRECOMPACT_MODEL_1M, PRECOMPACT_MODEL (legacy),
-  PRECOMPACT_STD_CTX_LIMIT, PRECOMPACT_LONG_CTX_LIMIT, PRECOMPACT_AUTO_RESUME
+  PRECOMPACT_STD_CTX_LIMIT, PRECOMPACT_LONG_CTX_LIMIT, PRECOMPACT_AUTO_RESUME,
+  COMPACTO_SIGNAL_DIR (shared with the daemon; overrides ~/.claude/compacto-signals)
 
 Precedence per setting: env var > config file > built-in default.
 """
@@ -126,7 +127,13 @@ def _truthy(v):
 # sessions each resume their own window and never cross-wire.
 AUTO_RESUME = _truthy(os.environ.get("PRECOMPACT_AUTO_RESUME"))
 TMUX_PANE = os.environ.get("TMUX_PANE", "")
-SIGNAL_DIR = pathlib.Path.home() / ".claude" / "compacto-signals"
+# Same env var the daemon reads, so one export aims both sides at one directory.
+# Needed when the hook's Python and the daemon's shell disagree about home —
+# e.g. Windows Python's C:\Users\x vs a POSIX shell's /home/x.
+SIGNAL_DIR = pathlib.Path(
+    os.environ.get("COMPACTO_SIGNAL_DIR")
+    or pathlib.Path.home() / ".claude" / "compacto-signals"
+)
 
 cwd_dir = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
 out_dir = pathlib.Path(cwd_dir) / ".claude" / "summaries"
