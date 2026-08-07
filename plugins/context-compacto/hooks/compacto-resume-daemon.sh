@@ -49,7 +49,13 @@ trap 'echo "compacto-resume-daemon: stopped."; exit 0' INT TERM
 conf_get() { [ -f "$CONF" ] && grep -E "^$1=" "$CONF" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
 is_num()   { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 pane_alive() { $TMUX_CMD list-panes -a -F '#{pane_id}' 2>/dev/null | grep -Fxq "$1"; }
-pane_idle()  { ! $TMUX_CMD capture-pane -p -t "$1" 2>/dev/null | tail -25 | grep -qiE "$BUSY_REGEX"; }
+pane_idle() {
+    local cap; cap="$($TMUX_CMD capture-pane -p -t "$1" 2>/dev/null | tail -25)"
+    # Not ready if generating ($BUSY_REGEX) OR a command is already queued. The queued
+    # check stops the 300s cooldown from stacking /compact behind a pane that's busy but
+    # not "generating" — e.g. a long-running background agent.
+    ! grep -qiE "$BUSY_REGEX" <<<"$cap" && ! grep -qiE 'queued message' <<<"$cap"
+}
 file_age()   { local f="$1" m; m=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0); echo $(( $(date +%s) - m )); }
 
 echo "compacto-resume-daemon: watching $SIGNAL_DIR (poll ${POLL}s, tmux='$TMUX_CMD'). Ctrl-C to stop."
@@ -72,9 +78,15 @@ while true; do
             fi
             case "$METRIC" in ctx) val="${cctx:-0}";; *) val="${cmsg:-0}";; esac
             is_num "$val" || continue
-            [ "$val" -ge "$THRESH" ] || continue
 
             cm="$SIGNAL_DIR/$key.compacting"        # debounce: one compaction in flight per pane
+            # Re-arm only when size actually drops back under the threshold. Clearing
+            # this on resume (as before) re-fired /compact every poll while the resume
+            # sat queued behind a busy pane and the size stayed high.
+            if [ "$val" -lt "$THRESH" ]; then
+                rm -f "$cm"
+                continue
+            fi
             if [ -e "$cm" ]; then
                 [ "$(file_age "$cm")" -gt "$COOLDOWN" ] && rm -f "$cm" || continue
             fi
@@ -100,7 +112,8 @@ while true; do
             continue
         fi
         key="${pane//[^a-zA-Z0-9]/}"
-        rm -f "$SIGNAL_DIR/$key.compacting"          # compaction cycle finished
+        # NB: do NOT clear .compacting here. Behavior 2 clears it only when the pane's
+        # size actually falls under the threshold, so a still-queued resume can't re-fire.
 
         if ! pane_alive "$pane"; then
             rm -f "$SIGNAL_DIR/$key.await-continue"
