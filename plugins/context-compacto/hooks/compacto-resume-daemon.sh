@@ -38,7 +38,7 @@ SIGNAL_DIR="${COMPACTO_SIGNAL_DIR:-$HOME/.claude/compacto-signals}"
 POLL="${COMPACTO_POLL_SECS:-1}"
 TMUX_CMD="${COMPACTO_TMUX:-tmux}"
 BUSY_REGEX="${COMPACTO_BUSY_REGEX:-esc to interrupt}"
-COOLDOWN="${COMPACTO_COMPACT_COOLDOWN:-300}"    # > hook's 240s summarizer timeout, so we never double-compact
+COOLDOWN="${COMPACTO_COMPACT_COOLDOWN:-300}"    # safety valve to clear a .compacting stuck by a FAILED compaction (no fork). A successful compaction is debounced by its pending .resume signal, not this timer — a big session can compact longer than COOLDOWN.
 SETTLE="${COMPACTO_CONTINUE_SETTLE:-3}"
 CONF="$HOME/.claude/precompact.conf"
 
@@ -76,6 +76,16 @@ while true; do
                 rm -f "$cf" "$SIGNAL_DIR/$key.compacting" "$SIGNAL_DIR/$key.await-continue"
                 continue
             fi
+            # A fork from the last /compact is still waiting to be resumed. Do NOT fire a
+            # second /compact on top of it — that stacks compactions and buries the resume
+            # behind them. This is state-based on purpose: the .compacting cooldown below is
+            # a time valve that expires when a compaction runs longer than COOLDOWN (a full
+            # 250k session's summarize+fork can outlast 300s), and that expiry is exactly the
+            # window this guard closes. Behavior 1 lands the resume, then val drops and the
+            # normal path re-arms.
+            if [ -e "$SIGNAL_DIR/$key.resume" ] || [ -e "$SIGNAL_DIR/$key.resume.busy" ]; then
+                continue
+            fi
             case "$METRIC" in ctx) val="${cctx:-0}";; *) val="${cmsg:-0}";; esac
             is_num "$val" || continue
 
@@ -106,8 +116,8 @@ while true; do
         busy="$f.busy"
         mv "$f" "$busy" 2>/dev/null || continue     # claim atomically
         IFS=$'\t' read -r pane fork < "$busy"
-        rm -f "$busy"
         if [ -z "${pane:-}" ] || [ -z "${fork:-}" ]; then
+            rm -f "$busy"
             echo "compacto-resume-daemon: malformed signal skipped (pane='${pane:-}' fork='${fork:-}')" >&2
             continue
         fi
@@ -116,11 +126,24 @@ while true; do
         # size actually falls under the threshold, so a still-queued resume can't re-fire.
 
         if ! pane_alive "$pane"; then
-            rm -f "$SIGNAL_DIR/$key.await-continue"
+            rm -f "$busy" "$SIGNAL_DIR/$key.await-continue"
             echo "compacto-resume-daemon: pane $pane gone; dropped resume $fork" >&2
             continue
         fi
+        # The hook drops this signal at the very end of compaction, while the pane
+        # still shows "esc to interrupt". Typing /resume then lands the keystrokes in
+        # a busy TUI and they're lost — the resume never comes. Put the signal back
+        # and retry on the next poll until the pane is back at a ready prompt. Same
+        # guard behavior 2 uses before /compact, so we also never yank the session
+        # out from under a turn the user started.
+        if ! pane_idle "$pane"; then
+            mv "$busy" "$f" 2>/dev/null || rm -f "$busy"
+            continue
+        fi
+        rm -f "$busy"
 
+        sleep "$SETTLE"                              # absorb the render frame before typing
+        pane_alive "$pane" || { rm -f "$SIGNAL_DIR/$key.await-continue"; continue; }
         $TMUX_CMD send-keys -t "$pane" "/resume $fork" Enter
         echo "compacto-resume-daemon: resumed $fork in pane $pane"
         # Drop the pre-compaction size reading; the fork's next statusline render
