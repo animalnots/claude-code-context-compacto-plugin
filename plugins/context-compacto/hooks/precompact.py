@@ -482,6 +482,24 @@ if summary and rewrite_transcript is not None:
 elif summary is None:
     fork_error = "no summary, fork skipped"
 
+# Executions ledger: one line per compaction that actually RAN, cross-project and
+# append-only. The daemon's events.log records what was *typed* (fires); this records
+# what *executed* — a fire with no matching line here means the /compact was eaten or
+# is still frozen in the pane's queue. That distinction took hours of preview-directory
+# archaeology to reconstruct after the fact; now it's one grep. Best-effort by design.
+try:
+    _ledger_dir = pathlib.Path(
+        os.environ.get("COMPACTO_SIGNAL_DIR", "") or str(pathlib.Path.home() / ".claude" / "compacto-signals")
+    )
+    _ledger_dir.mkdir(parents=True, exist_ok=True)
+    with (_ledger_dir / "compactions.log").open("a", encoding="utf-8") as _lf:
+        _lf.write(
+            f"{datetime.datetime.now():%F %T} session={session_id} trigger={trigger} "
+            f"pane={TMUX_PANE or '-'} msgs={N} fork={fork_id or f'FAILED({fork_error})'}\n"
+        )
+except Exception:
+    pass
+
 
 # ---- 9b. Arm auto-resume (opt-in, tmux-only) -----------------------------
 # Drop a per-pane signal file the resume daemon polls. Best-effort: a failed
