@@ -205,7 +205,9 @@ while true; do
                     rm -f "$cm"
                     n=$((n + 1)); echo "$n" > "$fc"
                     if [ "$n" -eq "$MAX_FAILS" ]; then
-                        echo "compacto-resume-daemon: pane $cpane WEDGED — /compact fired $n× but never executed (likely stuck queued input); backing off to ${WEDGE_BACKOFF}s. Clear the pane to recover." >&2
+                        # ${n} must stay braced: bash pulls the multibyte × into a bare $n's
+                        # name, and under set -u that unset "n×" variable killed the daemon.
+                        echo "compacto-resume-daemon: pane $cpane WEDGED — /compact fired ${n}× but never executed (likely stuck queued input); backing off to ${WEDGE_BACKOFF}s. Clear the pane to recover." >&2
                         evlog "WEDGED $cpane fails=$n backoff=${WEDGE_BACKOFF}s"
                     else
                         [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: release .compacting $cpane — idle+oversized ${gate}s, no fork (genuine fail #$n; will retry)" >&2
