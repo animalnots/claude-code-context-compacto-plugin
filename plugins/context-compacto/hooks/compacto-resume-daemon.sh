@@ -14,6 +14,9 @@
 #      (see README) drops <panekey>.ctx = "<pane-id>\t<ctx>\t<msgs>" every render.
 #      When a pane's live size crosses the threshold AND the pane is idle, this
 #      types `/compact`. Metric: auto_compact_metric=msgs|ctx (default msgs).
+#      A "!" anywhere in the tmux window name opts that window out; it's re-read
+#      every poll, so renaming the window back re-enables auto-compact. Resume (#1)
+#      still runs there, so a /compact you type yourself still gets its /resume.
 #
 #   3. POST-RESUME CONTINUE (resume_continue=<message>): after an auto-triggered
 #      compaction resumes, types <message> (e.g. "continue") so the task keeps
@@ -123,6 +126,7 @@ pane_pending_compact() {
     # delays a retry (wedge alert still fires), never stacks a second compact.
     $TMUX_CMD capture-pane -p -t "$1" 2>/dev/null | grep -qE '^\s*❯?\s*/compact\s*$'
 }
+pane_autocompact_optout() { [[ "$($TMUX_CMD display-message -p -t "$1" '#{window_name}' 2>/dev/null)" == *'!'* ]]; }
 # Durable event ledger. tmux scrollback truncates within hours under DEBUG (which is how
 # two investigations lost the fire history), so every consequential action also appends
 # here. Reconcile against the executions ledger compactions.log written by precompact.py:
@@ -217,6 +221,10 @@ while true; do
                     [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: suppress $cpane val=$val — compaction in flight/queued ($(file_age "$cm")s, fails=$n)" >&2
                     continue
                 fi
+            fi
+            if pane_autocompact_optout "$cpane"; then
+                [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: skip $cpane val=$val — '!' in window name (auto-compact opt-out)" >&2
+                continue
             fi
             if ! pane_idle "$cpane"; then           # never interrupt an in-progress turn
                 [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: skip $cpane val=$val — pane busy (would queue behind the turn)" >&2

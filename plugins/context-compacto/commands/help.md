@@ -39,6 +39,8 @@ Auto-resume needs: /cc:autoresume on + running inside tmux + compacto-resume-dae
 Autonomous loop (UNATTENDED, no cap): /cc:autocompact N + /cc:continue MSG make a pane compact at N
   tokens, auto-resume, then auto-send MSG -- looping with no human in it until you stop the daemon
   (Ctrl-C). Metric is msgs (the statusline number) unless you pass ctx. Needs the statusline export.
+  A ! anywhere in a tmux window's name exempts that window from auto-compact (re-read every poll;
+  a /compact you type there is still auto-resumed).
 
 Mutex per window (last command wins): /cc:begin clears head_pct; /cc:begin-pct clears head_tokens. Same for tail.
 Scope: ~/.claude/precompact.conf is global. Changes apply on the NEXT compact in any session — current, other running, or new. There is no per-session snapshot.

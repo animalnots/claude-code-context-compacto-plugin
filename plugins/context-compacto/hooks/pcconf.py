@@ -185,6 +185,8 @@ Autonomous loop (UNATTENDED, no cap): /cc:autocompact N + /cc:continue MSG make 
   human in it until you stop the daemon (Ctrl-C). Metric is msgs (the statusline
   number) unless you pass ctx. Needs the statusline context export (see README).
   Watch your usage: it runs until stopped.
+  A ! anywhere in a tmux window's name exempts that window from auto-compact
+  (re-read every poll; a /compact you type there is still auto-resumed).
 
 Mutex per window (last command wins): /cc:begin clears head_pct; /cc:begin-pct clears head_tokens.
   Mixing modes ACROSS windows is fine (e.g. head_tokens=20000 + tail_pct=15).

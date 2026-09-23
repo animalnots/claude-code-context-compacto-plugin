@@ -200,6 +200,8 @@ Run the **same daemon** as auto-resume — it does all three jobs.
 
 **Only auto-triggered compactions continue.** A manual `/compact` you run to inspect still auto-resumes but does **not** auto-send the message (the daemon only continues compactions it started).
 
+**Opt a window out with `!`.** Put `!` anywhere in a tmux window's name (`prefix ,` or `tmux rename-window 'review!'`) and the daemon never auto-`/compact`s a pane in that window. The name is re-read every poll, so renaming the window back re-enables auto-compact within a second. Auto-resume is untouched: a `/compact` you type there yourself still compacts through the plugin, and the daemon still types its `/resume`.
+
 **The fragile part — idle detection.** The daemon only fires `/compact` / `continue` when the pane looks idle, judged by the *absence* of the "generating" indicator (`esc to interrupt`) in the pane text. If your Claude Code shows a different string while working, verify and tune it:
 
 ```bash
