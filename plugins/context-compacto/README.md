@@ -202,12 +202,12 @@ Run the **same daemon** as auto-resume — it does all three jobs.
 
 **Opt a window out with `!`.** Put `!` anywhere in a tmux window's name (`prefix ,` or `tmux rename-window 'review!'`) and the daemon never auto-`/compact`s a pane in that window. The name is re-read every poll, so renaming the window back re-enables auto-compact within a second. Auto-resume is untouched: a `/compact` you type there yourself still compacts through the plugin, and the daemon still types its `/resume`.
 
-**The fragile part — idle detection.** The daemon only fires `/compact` / `continue` when the pane looks idle, judged by the *absence* of the "generating" indicator (`esc to interrupt`) in the pane text. If your Claude Code shows a different string while working, verify and tune it:
+**The fragile part — idle detection.** The daemon only types (`/compact`, `/resume`, `continue`) when the pane shows Claude's plain input box: a `❯` line directly under a `───` rule, with no spinner line (`✳ Scurrying… (3m 53s …)`), no `esc to interrupt` and no queued-message caption. A question, permission or trust dialog replaces that box, so the daemon waits instead of pressing Enter on it, which would pick option 1 for you. If your Claude Code shows a different busy string while working, add it:
 
 ```bash
-# while Claude is actively generating in pane %N, this SHOULD print a match:
-tmux capture-pane -p -t %N | grep -i 'esc to interrupt'
-# if it doesn't, point the daemon at the string your build shows:
+# while Claude is working in pane %N, one of these SHOULD print a match:
+tmux capture-pane -p -t %N | grep -E '^[^ ]+ [^()]+… \([0-9]+[hms]|esc to interrupt'
+# if neither does, point the daemon at the string your build shows:
 COMPACTO_BUSY_REGEX='your busy text' /path/to/compacto-resume-daemon.sh &
 ```
 

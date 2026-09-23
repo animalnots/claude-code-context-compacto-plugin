@@ -108,11 +108,22 @@ pane_idle() {
     # copy-mode (/ starts a search), so /compact and /resume never land. Treat any pane
     # the user is scrolling as not-ready: don't type into it, and retry once they exit.
     [ "$($TMUX_CMD display-message -p -t "$1" '#{pane_in_mode}' 2>/dev/null)" = 1 ] && return 1
-    local cap; cap="$($TMUX_CMD capture-pane -p -t "$1" 2>/dev/null | tail -25)"
+    # Until the screen fills, Claude's input box sits right under the content with blank rows
+    # below it, so read the 25 lines ending at the last non-blank one, not the bottom 25 rows.
+    local cap; cap="$($TMUX_CMD capture-pane -p -t "$1" 2>/dev/null | awk 'NF { last = NR } { l[NR] = $0 } END { for (i = last > 25 ? last - 24 : 1; i <= last; i++) print l[i] }')"
     # Not ready if generating ($BUSY_REGEX) OR a command is already queued. The queued
     # check stops the 300s cooldown from stacking /compact behind a pane that's busy but
     # not "generating" — e.g. a long-running background agent.
-    ! grep -qiE "$BUSY_REGEX" <<<"$cap" && ! grep -qiE 'queued message' <<<"$cap"
+    grep -qiE "$BUSY_REGEX" <<<"$cap" && return 1
+    grep -qiE 'queued message' <<<"$cap" && return 1
+    # Bypass-permissions mode never shows "esc to interrupt"; the spinner line
+    # "✳ Scurrying… (3m 53s · ↓ 24.5k tokens)" is its only busy marker. Column 0 and not a ⏺
+    # message line, so prose quoting it doesn't count; a finished turn reads "✻ Baked for 5m 16s".
+    grep -E '^[^ ]+ [^()]+… \([0-9]+[hms]' <<<"$cap" | grep -qv '^⏺' && return 1
+    # Type only into the plain input box, whose "❯" line sits directly under a "───" rule. A
+    # question, permission or trust dialog replaces the box and puts its "❯ 1." cursor under
+    # the question text, where the Enter we send would pick option 1 for the user.
+    awk '/^❯/ { ok = (prev ~ /^───/) } { prev = $0 } END { exit !ok }' <<<"$cap"
 }
 pane_pending_compact() {
     # A /compact we sent can freeze in the pane's input queue: the agent goes idle
@@ -227,7 +238,7 @@ while true; do
                 continue
             fi
             if ! pane_idle "$cpane"; then           # never interrupt an in-progress turn
-                [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: skip $cpane val=$val — pane busy (would queue behind the turn)" >&2
+                [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: skip $cpane val=$val — pane busy or not at a plain prompt (working, queued input, or a dialog open)" >&2
                 continue
             fi
             # Belt-and-braces independent of marker state: if a /compact is already visibly
