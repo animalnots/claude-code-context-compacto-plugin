@@ -217,12 +217,12 @@ set -g window-status-current-format '#I:#{@cc_state}#W#{?window_flags,#{window_f
 
 With a themed format, put `#{@cc_state}` wherever you want the marker. Window names are never changed, so `!` opt-outs, `prefix ,` and tmux-resurrect saves are unaffected.
 
-**The fragile part — idle detection.** The daemon only types (`/compact`, `/resume`, `continue`) when the pane shows Claude's plain input box: a `❯` line directly under a `───` rule, with no spinner line (`✳ Scurrying… (3m 53s …)`), no `esc to interrupt` and no queued-message caption. A question, permission or trust dialog replaces that box, so the daemon waits instead of pressing Enter on it, which would pick option 1 for you. If your Claude Code shows a different busy string while working, add it:
+**The fragile part — idle detection.** The daemon only types (`/compact`, `/resume`, `continue`) into Claude's plain input box, a `❯` line directly under a `───` rule, and only when the status line above that box shows a finished turn: `✻ Baked for 5m 16s · done 23:03`, `✻ Waiting for 2 background agents to finish`, or no status line at all. Any other status line means Claude is mid-turn, however it's worded: `✳ Scurrying… (3m 53s …)`, a hook's `(Checking UI changes… · 30m 43s …)`, `Waiting for API response · will retry in 2m 40s`. `esc to interrupt` or a queued-message caption anywhere near the box also means busy. A question, permission or trust dialog replaces the box, so the daemon waits instead of pressing Enter on it, which would pick option 1 for you. If your Claude Code words a finished turn differently, the daemon waits instead of typing. Check what it sees:
 
 ```bash
-# while Claude is working in pane %N, one of these SHOULD print a match:
-tmux capture-pane -p -t %N | grep -E '^[^ ]+ [^()]+… \([0-9]+[hms]|esc to interrupt'
-# if neither does, point the daemon at the string your build shows:
+# once Claude is idle in pane %N, this SHOULD print a finished line like "✻ Baked for 5m 16s · done 23:03":
+tmux capture-pane -p -t %N | grep -E '^(·|✢|✳|✶|✻|✽|\*) ' | tail -1
+# to also treat some other on-screen text as busy:
 COMPACTO_BUSY_REGEX='your busy text' /path/to/compacto-resume-daemon.sh &
 ```
 

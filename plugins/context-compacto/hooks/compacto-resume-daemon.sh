@@ -135,6 +135,11 @@ function classify(    first, i, s, busy, box, footer, bg) {
     }
     if (busy) return "busy"
     if (!box) return (line[last] ~ /Esc to cancel/) ? "dialog" : "unknown"
+    # Only a finished turn's status line means idle: "✻ Sautéed for 5m 51s · done 1:11" or
+    # "✻ Waiting for 6 background agents to finish". A turn in progress is worded many ways, e.g.
+    # "(Checking UI changes… · 30m 43s" or "Waiting for API response · will retry in 2m 40s".
+    for (i = box - 1; i >= 1; i--) if (line[i] ~ /^(·|✢|✳|✶|✻|✽|\*) /) break
+    if (i >= 1 && line[i] !~ /^[^ ]+ [^ ]+ for [0-9]+[hms]/ && line[i] !~ /^[^ ]+ Waiting for [0-9]+ background agents? to finish/) return "busy"
     # Claude wakes itself when background work finishes, so the box is not "done" while a
     # "✻ Waiting for 6 background agents to finish" or "… · 1 shell still running" line sits
     # above it or the footer under it shows "· 1 shell ·". Messages and prompts can quote those.
@@ -188,7 +193,7 @@ file_age()   { local f="$1" m; m=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f
 
 # Behavior 4 keeps per-pane memory indexed by pane number (%12 -> 12). It starts empty, so
 # after a daemon restart, panes that are already idle count as seen.
-PANE_STATE=(); PANE_UNSEEN=(); PANE_READ_AT=(); PANE_CONTINUED=()
+PANE_STATE=(); PANE_UNSEEN=(); PANE_READ_AT=(); PANE_CONTINUED=(); PANE_QUIET=()
 # The daemon's own /compact -> /resume cycle is housekeeping, not a finished turn, until it
 # types a continue that sets Claude working again.
 compaction_in_flight() {
@@ -207,7 +212,7 @@ update_markers() {
         n="${pane#%}"; w="${win#@}"
         if [ -z "${rank[$w]:-}" ]; then rank[$w]=0; shown_now[$w]="$shown"; wins="$wins $w"; fi
         if ! [[ "$cmd" =~ $CLAUDE_CMD_REGEX ]]; then
-            unset "PANE_STATE[$n]" "PANE_UNSEEN[$n]" "PANE_READ_AT[$n]"
+            unset "PANE_STATE[$n]" "PANE_UNSEEN[$n]" "PANE_READ_AT[$n]" "PANE_QUIET[$n]"
             continue
         fi
         claude="$claude $n"; pane_win[$n]="$w"
@@ -226,11 +231,14 @@ update_markers() {
         while read -r n st; do
             [ -n "$n" ] && [ -n "${pane_win[$n]:-}" ] || continue
             prev="${PANE_STATE[$n]:-}"; PANE_STATE[$n]="$st"; PANE_READ_AT[$n]="$now"
+            # "In flight" as of the previous read: a turn that ended just before the daemon typed
+            # /compact still finished; only the compaction's own busy stretch stays quiet.
             if [ "$st" = ready ]; then
                 case "$prev" in busy|dialog|background)
-                    [ "${pane_viewed[$n]}" = 1 ] || compaction_in_flight "%$n" || PANE_UNSEEN[$n]=1 ;;
+                    [ "${pane_viewed[$n]}" = 1 ] || [ "${PANE_QUIET[$n]:-0}" = 1 ] || PANE_UNSEEN[$n]=1 ;;
                 esac
             fi
+            PANE_QUIET[$n]=0; compaction_in_flight "%$n" && PANE_QUIET[$n]=1
         done <<<"$($TMUX_CMD "${reads[@]}" 2>/dev/null | screen_state)"
     fi
     for n in $claude; do
