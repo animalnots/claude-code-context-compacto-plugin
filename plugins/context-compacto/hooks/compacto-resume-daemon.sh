@@ -2,7 +2,7 @@
 # compacto-resume-daemon.sh — auto-resume watcher for the context-compacto plugin,
 # with optional threshold auto-compact and post-resume continue.
 #
-# THREE behaviors. #1 always runs; #2 and #3 are OFF by default and configured in
+# FOUR behaviors. #1 and #4 always run; #2 and #3 are OFF by default and configured in
 # ~/.claude/precompact.conf (read fresh every poll, so /cc: changes apply live):
 #
 #   1. RESUME (always): when the precompact hook forks a session it drops
@@ -23,6 +23,11 @@
 #      going. UNBOUNDED — runs until you stop this daemon. Only fires for compacts
 #      THIS daemon triggered (behavior 2), never for a manual /compact.
 #
+#   4. WINDOW MARKERS (always): sets the tmux window option @cc_state on windows running
+#      Claude: "?" a question/permission/trust dialog waits for you, "$" Claude finished
+#      while you weren't viewing the window, "&" idle but background agents or shells are
+#      still running. Invisible unless window-status-format prints #{@cc_state} (see README).
+#
 # Run ONE of these (serves every pane on the tmux server). Ctrl-C to stop —
 # stopping it is the off-switch for the whole autonomous loop.
 #
@@ -31,6 +36,8 @@
 #   COMPACTO_POLL_SECS       poll interval         (default 1)
 #   COMPACTO_TMUX            tmux command           (default "tmux"; e.g. "tmux -L sock")
 #   COMPACTO_BUSY_REGEX      "pane is generating" marker (default "esc to interrupt")
+#   COMPACTO_CLAUDE_CMD_REGEX  pane_current_command of a Claude pane, for markers
+#                            (default "^([0-9]+\.[0-9]+\.[0-9]+|claude|node)$")
 #   COMPACTO_COMPACT_COOLDOWN secs before a stuck .compacting marker clears (default 300)
 #   COMPACTO_CONTINUE_SETTLE  secs to let a resume render before typing continue (default 3)
 #   COMPACTO_REARM_GRACE      secs a pane must stay below threshold before re-arming (default 15)
@@ -46,6 +53,8 @@ SIGNAL_DIR="${COMPACTO_SIGNAL_DIR:-$HOME/.claude/compacto-signals}"
 POLL="${COMPACTO_POLL_SECS:-1}"
 TMUX_CMD="${COMPACTO_TMUX:-tmux}"
 BUSY_REGEX="${COMPACTO_BUSY_REGEX:-esc to interrupt}"
+# The native installer runs Claude as a binary named after its version (2.1.281); npm runs it as node.
+CLAUDE_CMD_REGEX="${COMPACTO_CLAUDE_CMD_REGEX:-^([0-9]+\.[0-9]+\.[0-9]+|claude|node)\$}"
 COOLDOWN="${COMPACTO_COMPACT_COOLDOWN:-300}"    # safety valve to clear a .compacting stuck by a FAILED compaction (no fork). A successful compaction is debounced by its pending .resume signal, not this timer — a big session can compact longer than COOLDOWN.
 SETTLE="${COMPACTO_CONTINUE_SETTLE:-3}"
 # Hard floor between auto-compacts on the SAME pane. Backstop for spam: if a /resume
@@ -96,11 +105,55 @@ if ! mkdir "$LOCK" 2>/dev/null; then
     mkdir "$LOCK" 2>/dev/null || { echo "compacto-resume-daemon: cannot acquire lock $LOCK" >&2; exit 1; }
 fi
 echo $$ > "$LOCK/pid"
-trap 'rm -rf "$LOCK"; echo "compacto-resume-daemon: stopped."; exit 0' INT TERM
+trap 'clear_markers; rm -rf "$LOCK"; echo "compacto-resume-daemon: stopped."; exit 0' INT TERM
 
 conf_get() { [ -f "$CONF" ] && grep -E "^$1=" "$CONF" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
 is_num()   { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 pane_alive() { $TMUX_CMD list-panes -a -F '#{pane_id}' 2>/dev/null | grep -Fxq "$1"; }
+# Classifies a Claude screen (capture-pane output on stdin) for both the typing gate and the
+# window markers: busy, ready (the plain input box), background (that box while background
+# agents or shells still run), dialog (a question/permission/trust dialog) or unknown.
+IFS= read -r -d '' SCREEN_AWK <<'AWK'
+function classify(    first, i, s, busy, box, footer, bg) {
+    # Until the screen fills, Claude's input box sits right under the content with blank rows
+    # below it, so read the 25 lines ending at the last non-blank one, not the bottom 25 rows.
+    first = last > 25 ? last - 24 : 1
+    for (i = first; i <= last; i++) {
+        s = line[i]
+        # Busy if generating (BUSY_REGEX) OR a command is already queued. The queued
+        # check stops the 300s cooldown from stacking /compact behind a pane that's busy but
+        # not "generating" — e.g. a long-running background agent.
+        if (tolower(s) ~ tolower(ENVIRON["BUSY_REGEX"]) || tolower(s) ~ /queued message/) busy = 1
+        # Bypass-permissions mode never shows "esc to interrupt"; the spinner line
+        # "✳ Scurrying… (3m 53s · ↓ 24.5k tokens)" is its only busy marker. Column 0 and not a ⏺
+        # message line, so prose quoting it doesn't count; a finished turn reads "✻ Baked for 5m 16s".
+        if (s ~ /^[^ ]+ [^()]+… \([0-9]+[hms]/ && s !~ /^⏺/) busy = 1
+        # Type only into the plain input box, whose "❯" line sits directly under a "───" rule. A
+        # question, permission or trust dialog replaces the box and puts its "❯ 1." cursor under
+        # the question text, where the Enter we send would pick option 1 for the user.
+        if (s ~ /^❯/) box = (i > first && line[i - 1] ~ /^───/) ? i : 0
+    }
+    if (busy) return "busy"
+    if (!box) return (line[last] ~ /Esc to cancel/) ? "dialog" : "unknown"
+    # Claude wakes itself when background work finishes, so the box is not "done" while a
+    # "✻ Waiting for 6 background agents to finish" or "… · 1 shell still running" line sits
+    # above it or the footer under it shows "· 1 shell ·". Messages and prompts can quote those.
+    for (i = first; i <= last; i++) {
+        s = line[i]
+        if (i > box && s ~ /^───/) footer = 1
+        if (s ~ /^(⏺|❯)/) continue
+        if (s ~ /^[^ ]+ Waiting for [0-9]+ background agents? to finish/ || s ~ /^[^ ]+ .*[0-9]+ shells? still running/) bg = 1
+        if (footer && s ~ /· [0-9]+ shells?( |$)/) bg = 1
+    }
+    return bg ? "background" : "ready"
+}
+# One run can classify several panes: a "@@compacto-pane N" line starts the screen of pane %N,
+# and each screen prints as "N state". A lone screen with no such line prints just its state.
+/^@@compacto-pane [0-9]+$/ { if (id != "") print id, classify(); id = $2; n = last = 0; next }
+{ line[++n] = $0; if (NF) last = n }
+END { print (id != "" ? id " " : "") classify() }
+AWK
+screen_state() { BUSY_REGEX="$BUSY_REGEX" awk "$SCREEN_AWK"; }
 pane_idle() {
     # In tmux copy-mode the pane is scrolled up, so capture-pane returns the scrolled
     # viewport, not the live prompt — the busy/queued markers below sit off-screen and
@@ -108,22 +161,10 @@ pane_idle() {
     # copy-mode (/ starts a search), so /compact and /resume never land. Treat any pane
     # the user is scrolling as not-ready: don't type into it, and retry once they exit.
     [ "$($TMUX_CMD display-message -p -t "$1" '#{pane_in_mode}' 2>/dev/null)" = 1 ] && return 1
-    # Until the screen fills, Claude's input box sits right under the content with blank rows
-    # below it, so read the 25 lines ending at the last non-blank one, not the bottom 25 rows.
-    local cap; cap="$($TMUX_CMD capture-pane -p -t "$1" 2>/dev/null | awk 'NF { last = NR } { l[NR] = $0 } END { for (i = last > 25 ? last - 24 : 1; i <= last; i++) print l[i] }')"
-    # Not ready if generating ($BUSY_REGEX) OR a command is already queued. The queued
-    # check stops the 300s cooldown from stacking /compact behind a pane that's busy but
-    # not "generating" — e.g. a long-running background agent.
-    grep -qiE "$BUSY_REGEX" <<<"$cap" && return 1
-    grep -qiE 'queued message' <<<"$cap" && return 1
-    # Bypass-permissions mode never shows "esc to interrupt"; the spinner line
-    # "✳ Scurrying… (3m 53s · ↓ 24.5k tokens)" is its only busy marker. Column 0 and not a ⏺
-    # message line, so prose quoting it doesn't count; a finished turn reads "✻ Baked for 5m 16s".
-    grep -E '^[^ ]+ [^()]+… \([0-9]+[hms]' <<<"$cap" | grep -qv '^⏺' && return 1
-    # Type only into the plain input box, whose "❯" line sits directly under a "───" rule. A
-    # question, permission or trust dialog replaces the box and puts its "❯ 1." cursor under
-    # the question text, where the Enter we send would pick option 1 for the user.
-    awk '/^❯/ { ok = (prev ~ /^───/) } { prev = $0 } END { exit !ok }' <<<"$cap"
+    # Waiting on background work counts as idle: a dev server in the background never
+    # finishes, so holding /compact for it could stall a pane forever.
+    case "$($TMUX_CMD capture-pane -p -t "$1" 2>/dev/null | screen_state)" in ready|background) return 0 ;; esac
+    return 1
 }
 pane_pending_compact() {
     # A /compact we sent can freeze in the pane's input queue: the agent goes idle
@@ -145,7 +186,92 @@ pane_autocompact_optout() { [[ "$($TMUX_CMD display-message -p -t "$1" '#{window
 evlog() { echo "$(date '+%F %T') $*" >> "$SIGNAL_DIR/events.log" 2>/dev/null || true; }
 file_age()   { local f="$1" m; m=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0); echo $(( $(date +%s) - m )); }
 
+# Behavior 4 keeps per-pane memory indexed by pane number (%12 -> 12). It starts empty, so
+# after a daemon restart, panes that are already idle count as seen.
+PANE_STATE=(); PANE_UNSEEN=(); PANE_READ_AT=(); PANE_CONTINUED=()
+# The daemon's own /compact -> /resume cycle is housekeeping, not a finished turn, until it
+# types a continue that sets Claude working again.
+compaction_in_flight() {
+    local k="${1//[^a-zA-Z0-9]/}"
+    [ "${PANE_CONTINUED[${1#%}]:-0}" = 1 ] && return 1
+    [ -e "$SIGNAL_DIR/$k.compacting" ] || [ -e "$SIGNAL_DIR/$k.resume" ] || [ -e "$SIGNAL_DIR/$k.resume.busy" ] || [ -e "$SIGNAL_DIR/$k.resumewant" ]
+}
+update_markers() {
+    local panes now pane win inmode wactive attached activity shown cmd n w st prev r m wins="" claude="" batch=0
+    local -a rank shown_now pane_win pane_viewed reads
+    # "|", not a tab: read merges runs of tabs, so one empty field would shift the rest.
+    panes="$($TMUX_CMD list-panes -a -F '#{pane_id}|#{window_id}|#{pane_in_mode}|#{window_active}|#{session_attached}|#{window_activity}|#{@cc_state}|#{pane_current_command}' 2>/dev/null)"
+    [ -n "$panes" ] || return 0
+    now="${EPOCHSECONDS:-$(date +%s)}"
+    while IFS='|' read -r pane win inmode wactive attached activity shown cmd; do
+        n="${pane#%}"; w="${win#@}"
+        if [ -z "${rank[$w]:-}" ]; then rank[$w]=0; shown_now[$w]="$shown"; wins="$wins $w"; fi
+        if ! [[ "$cmd" =~ $CLAUDE_CMD_REGEX ]]; then
+            unset "PANE_STATE[$n]" "PANE_UNSEEN[$n]" "PANE_READ_AT[$n]"
+            continue
+        fi
+        claude="$claude $n"; pane_win[$n]="$w"
+        pane_viewed[$n]=0; [ "$wactive" = 1 ] && [ "${attached:-0}" -gt 0 ] && pane_viewed[$n]=1
+        # Re-read only panes that printed something since the last read (>= so output in the
+        # same second as that read still gets one more read). Keep the last state while scrolling.
+        if [ "$inmode" != 1 ] && { [ -z "${PANE_STATE[$n]:-}" ] || [ "${activity:-0}" -ge "${PANE_READ_AT[$n]:-0}" ]; }; then
+            [ "$batch" = 0 ] || reads+=(';')
+            # Bare number, not %N: display-message runs its text through strftime, which eats "%1".
+            reads+=(display-message -p "@@compacto-pane $n" ';' capture-pane -p -t "$pane"); batch=1
+        fi
+    done <<<"$panes"
+    # One tmux call and one awk run read every pane that needs it. A pane closed since list-panes
+    # aborts the rest of the chain; the panes after it keep their state and are read next poll.
+    if [ "$batch" = 1 ]; then
+        while read -r n st; do
+            [ -n "$n" ] && [ -n "${pane_win[$n]:-}" ] || continue
+            prev="${PANE_STATE[$n]:-}"; PANE_STATE[$n]="$st"; PANE_READ_AT[$n]="$now"
+            if [ "$st" = ready ]; then
+                case "$prev" in busy|dialog|background)
+                    [ "${pane_viewed[$n]}" = 1 ] || compaction_in_flight "%$n" || PANE_UNSEEN[$n]=1 ;;
+                esac
+            fi
+        done <<<"$($TMUX_CMD "${reads[@]}" 2>/dev/null | screen_state)"
+    fi
+    for n in $claude; do
+        w="${pane_win[$n]}"
+        [ "${pane_viewed[$n]}" = 1 ] && PANE_UNSEEN[$n]=0
+        case "${PANE_STATE[$n]:-}" in
+            dialog) r=3 ;;
+            ready) [ "${PANE_UNSEEN[$n]:-0}" = 1 ] && r=2 || r=0 ;;
+            background) r=1 ;;
+            *) r=0 ;;
+        esac
+        [ "$r" -gt "${rank[$w]}" ] && rank[$w]=$r
+    done
+    for w in $wins; do
+        case "${rank[$w]}" in 3) m='?' ;; 2) m='$' ;; 1) m='&' ;; *) m='' ;; esac
+        [ "$m" = "${shown_now[$w]}" ] && continue
+        if [ -n "$m" ]; then $TMUX_CMD set-option -w -t "@$w" @cc_state "$m"; else $TMUX_CMD set-option -wu -t "@$w" @cc_state; fi
+        [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: window @$w marker '${shown_now[$w]}' -> '$m'" >&2
+    done
+    return 0
+}
+clear_markers() {
+    local w m
+    while read -r w m; do
+        [ -n "$m" ] && $TMUX_CMD set-option -wu -t "$w" @cc_state
+    done <<<"$($TMUX_CMD list-windows -a -F '#{window_id} #{@cc_state}' 2>/dev/null)"
+}
+# Markers show only through a tmux format that prints @cc_state, so skip their work until some
+# option mentions it. Re-checked every 30s: adding the format lines turns markers on.
+MARKERS_CHECKED_AT=0; MARKERS_WANTED=0
+markers_wanted() {
+    local now="${EPOCHSECONDS:-$(date +%s)}"
+    if [ $((now - MARKERS_CHECKED_AT)) -ge 30 ]; then
+        MARKERS_CHECKED_AT=$now; MARKERS_WANTED=0
+        $TMUX_CMD show-options -g \; show-options -gw 2>/dev/null | grep -q '@cc_state' && MARKERS_WANTED=1
+    fi
+    [ "$MARKERS_WANTED" = 1 ]
+}
+
 echo "compacto-resume-daemon: watching $SIGNAL_DIR (poll ${POLL}s, tmux='$TMUX_CMD'). Ctrl-C to stop."
+clear_markers                                       # left behind by a daemon that was SIGKILLed
 
 while true; do
     THRESH="$(conf_get auto_compact_at)"
@@ -253,7 +379,7 @@ while true; do
             fi
             $TMUX_CMD send-keys -t "$cpane" "/compact" Enter
             evlog "fire $cpane $METRIC=$val"
-            : > "$cm"; : > "$la"
+            : > "$cm"; : > "$la"; unset "PANE_CONTINUED[${cpane#%}]"
             [ -n "$CONTINUE_MSG" ] && : > "$SIGNAL_DIR/$key.await-continue"
             rm -f "$cf"    # consume this reading; .compacting debounces until the fork resumes
             echo "compacto-resume-daemon: auto-compact $cpane ($METRIC=$val >= $THRESH)"
@@ -350,6 +476,7 @@ while true; do
                 ac="$SIGNAL_DIR/$rkey.await-continue"
                 if [ -e "$ac" ] && [ -n "$CONTINUE_MSG" ] && pane_idle "$rpane"; then
                     $TMUX_CMD send-keys -t "$rpane" "$CONTINUE_MSG" Enter
+                    PANE_CONTINUED[${rpane#%}]=1
                     echo "compacto-resume-daemon: continued $rpane with: $CONTINUE_MSG"
                     rm -f "$ac"
                 fi
@@ -373,5 +500,6 @@ while true; do
         fi
     done
 
+    markers_wanted && update_markers
     sleep "$POLL"
 done

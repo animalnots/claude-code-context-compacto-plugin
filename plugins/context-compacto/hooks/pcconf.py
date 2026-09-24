@@ -188,6 +188,11 @@ Autonomous loop (UNATTENDED, no cap): /cc:autocompact N + /cc:continue MSG make 
   A ! anywhere in a tmux window's name exempts that window from auto-compact
   (re-read every poll; a /compact you type there is still auto-resumed).
 
+Window markers (daemon running, inside tmux): the window option @cc_state is
+  ? when a dialog waits for you, $ when Claude finished while you weren't viewing
+  that window, & when it's idle but background agents/shells still run. Add
+  #{@cc_state} to window-status-format to see it (see README).
+
 Mutex per window (last command wins): /cc:begin clears head_pct; /cc:begin-pct clears head_tokens.
   Mixing modes ACROSS windows is fine (e.g. head_tokens=20000 + tail_pct=15).
 

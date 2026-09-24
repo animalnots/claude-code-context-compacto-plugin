@@ -202,6 +202,21 @@ Run the **same daemon** as auto-resume — it does all three jobs.
 
 **Opt a window out with `!`.** Put `!` anywhere in a tmux window's name (`prefix ,` or `tmux rename-window 'review!'`) and the daemon never auto-`/compact`s a pane in that window. The name is re-read every poll, so renaming the window back re-enables auto-compact within a second. Auto-resume is untouched: a `/compact` you type there yourself still compacts through the plugin, and the daemon still types its `/resume`.
 
+**Window markers: `?`, `$`, `&`.** The daemon also labels every tmux window running Claude by setting the window option `@cc_state`:
+
+- `?` a question, permission or trust dialog is waiting for you;
+- `$` Claude finished while you weren't viewing that window (it clears once you look);
+- `&` Claude is idle, but background agents or shells are still running, and it will wake itself when they finish.
+
+The daemon's own `/compact` + `/resume` never produces a `$`. Nothing shows until your status line prints the option. For tmux's default window format, add to `~/.tmux.conf`:
+
+```tmux
+set -g window-status-format '#I:#{@cc_state}#W#{?window_flags,#{window_flags}, }'
+set -g window-status-current-format '#I:#{@cc_state}#W#{?window_flags,#{window_flags}, }'
+```
+
+With a themed format, put `#{@cc_state}` wherever you want the marker. Window names are never changed, so `!` opt-outs, `prefix ,` and tmux-resurrect saves are unaffected.
+
 **The fragile part — idle detection.** The daemon only types (`/compact`, `/resume`, `continue`) when the pane shows Claude's plain input box: a `❯` line directly under a `───` rule, with no spinner line (`✳ Scurrying… (3m 53s …)`), no `esc to interrupt` and no queued-message caption. A question, permission or trust dialog replaces that box, so the daemon waits instead of pressing Enter on it, which would pick option 1 for you. If your Claude Code shows a different busy string while working, add it:
 
 ```bash
@@ -216,6 +231,7 @@ COMPACTO_BUSY_REGEX='your busy text' /path/to/compacto-resume-daemon.sh &
 ```
 COMPACTO_TMUX=tmux                       # tmux command (e.g. "tmux -L socket")
 COMPACTO_BUSY_REGEX='esc to interrupt'   # "pane is generating" marker (idle = absent)
+COMPACTO_CLAUDE_CMD_REGEX='^([0-9]+\.[0-9]+\.[0-9]+|claude|node)$'   # process name of a Claude pane (window markers)
 COMPACTO_COMPACT_COOLDOWN=300            # secs before a stuck in-flight compaction is retried (> the 240s summarizer timeout)
 COMPACTO_CONTINUE_SETTLE=3               # secs to let a resume render before typing the continue message
 COMPACTO_POLL_SECS=1                     # poll interval
