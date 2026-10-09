@@ -174,6 +174,7 @@ function Invoke-Resume {
     if (-not (Test-Path -LiteralPath $StateFile)) { Write-Log 'resume: no snapshot yet'; return }
     try { $state = Get-Content -Raw -LiteralPath $StateFile | ConvertFrom-Json } catch { Write-Log "resume: unreadable snapshot: $_"; return }
     $live = @(Get-ClaudePanes)
+    $started = @{}
     Start-Sleep -Seconds 2
     foreach ($e in @($state.panes)) {
         $target = '={0}:{1}.{2}' -f $e.session, $e.window, $e.pane
@@ -183,8 +184,10 @@ function Invoke-Resume {
         if (@($live | Where-Object { $_.session -eq $e.session -and $_.window -eq $e.window -and $_.pane -eq $e.pane }).Count) {
             Write-Log "skip ${target}: Claude is already running there"; continue
         }
-        # Two Claude processes on one conversation would both append to its transcript.
-        if (@($live | Where-Object { $_.sessionId -eq $e.sessionId }).Count) { Write-Log "skip ${target}: $($e.sessionId) is open elsewhere"; continue }
+        # Two Claude processes on one conversation would both append to its transcript. A snapshot lists one
+        # twice when it was resumed in two panes; only the first of them gets it back.
+        if ($started[$e.sessionId] -or @($live | Where-Object { $_.sessionId -eq $e.sessionId }).Count) { Write-Log "skip ${target}: $($e.sessionId) is open elsewhere"; continue }
+        $started[$e.sessionId] = $true
         $line = 'Set-Location -LiteralPath {0} -ErrorAction SilentlyContinue; & {1}' -f (Format-PsArg $e.cwd), (Format-PsArg $e.exe)
         foreach ($a in @($e.args)) { $line += ' ' + (Format-PsArg $a) }
         $line += ' --resume ' + (Format-PsArg $e.sessionId)
