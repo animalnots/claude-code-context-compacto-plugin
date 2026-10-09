@@ -2,5 +2,5 @@
 # ("$'\r': command not found"), and core.autocrlf=true, the Windows default, checks them out CRLF.
 *.sh  text eol=lf
 
-# Same for the PowerShell scripts, so one checkout serves every machine.
+# PowerShell accepts either line ending; LF keeps the copies users install identical to the repo.
 *.ps1 text eol=lf
