@@ -317,7 +317,9 @@ while true; do
             IFS=$'\t' read -r cpane cctx cmsg cserver < "$cf"
             cpane="${cpane%$'\r'}"; cctx="${cctx%$'\r'}"; cmsg="${cmsg%$'\r'}"; cserver="${cserver%$'\r'}"
             [ -n "${cpane:-}" ] || continue
-            key="${cf##*/}"; key="${key%.ctx}"      # the writer's key; on psmux it includes the server
+            # From the line, not the file name, so it pairs with the hook's .resume however the
+            # statusline named this file: <pane digits>, on psmux <server pid>_<pane digits>.
+            key="${cserver:+${cserver}_}${cpane//[^a-zA-Z0-9]/}"
             ctgt="$(pane_target "${cpane}" "$cserver")"; rc=$?
             if [ "$rc" = 1 ]; then                  # session closed -> clean up its files
                 rm -f "$cf" "$SIGNAL_DIR/$key.compacting" "$SIGNAL_DIR/$key.await-continue" "$SIGNAL_DIR/$key.lastauto" "$SIGNAL_DIR/$key.belowsince" "$SIGNAL_DIR/$key.resumewant" "$SIGNAL_DIR/$key.failcount"
@@ -434,7 +436,7 @@ while true; do
             echo "compacto-resume-daemon: malformed signal skipped (pane='${pane:-}' fork='${fork:-}')" >&2
             continue
         fi
-        key="${f##*/}"; key="${key%.resume}"
+        key="${pserver:+${pserver}_}${pane//[^a-zA-Z0-9]/}"
         # .compacting is NOT cleared in this loop at all — only behavior 2 clears it, and
         # only after the pane's size is confirmed durably below the threshold. That way a
         # /resume that doesn't actually land can't re-arm a second /compact.
@@ -499,7 +501,7 @@ while true; do
         [ -e "$w" ] || continue
         IFS=$'\t' read -r rpane rfork rsince rserver < "$w"
         [ -n "${rpane:-}" ] && [ -n "${rfork:-}" ] || { rm -f "$w"; continue; }
-        rkey="${w##*/}"; rkey="${rkey%.resumewant}"
+        rkey="${rserver:+${rserver}_}${rpane//[^a-zA-Z0-9]/}"
         if ! is_num "$THRESH" || [ "$THRESH" -le 0 ]; then rm -f "$w"; continue; fi   # can't confirm without a threshold
         rtgt="$(pane_target "${rpane}" "${rserver:-}")"; rc=$?
         if [ "$rc" = 1 ]; then rm -f "$w" "$SIGNAL_DIR/$rkey.await-continue"; continue; fi
