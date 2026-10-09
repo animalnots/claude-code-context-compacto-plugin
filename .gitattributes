@@ -1,0 +1,6 @@
+# Shell scripts must stay LF on every platform: bash on Linux and WSL rejects a CRLF script
+# ("$'\r': command not found"), and core.autocrlf=true, the Windows default, checks them out CRLF.
+*.sh  text eol=lf
+
+# Same for the PowerShell scripts, so one checkout serves every machine.
+*.ps1 text eol=lf
