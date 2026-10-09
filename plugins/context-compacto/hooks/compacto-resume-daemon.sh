@@ -10,7 +10,7 @@
 #      This types `/resume <fork-id>` into that exact pane — the keystroke you'd
 #      type by hand. Keyed on $TMUX_PANE, so N parallel sessions never cross-wire.
 #
-#   2. THRESHOLD AUTO-COMPACT (auto_compact_at=<tokens>): the statusline export
+#   2. THRESHOLD AUTO-COMPACT (auto_compact_at=<tokens>, default 300000, 0 = off): the statusline export
 #      (see README) drops <panekey>.ctx = "<pane-id>\t<ctx>\t<msgs>" every render.
 #      When a pane's live size crosses the threshold AND the pane is idle, this
 #      types `/compact`. Metric: auto_compact_metric=msgs|ctx (default msgs).
@@ -305,7 +305,7 @@ echo "compacto-resume-daemon: watching $SIGNAL_DIR (poll ${POLL}s, tmux='$TMUX_C
 clear_markers                                       # left behind by a daemon that was SIGKILLed
 
 while true; do
-    THRESH="$(conf_get auto_compact_at)"
+    THRESH="$(conf_get auto_compact_at)"; [ -n "$THRESH" ] || THRESH=300000   # pcconf.py's AUTO_COMPACT_DEFAULT; off is a stored 0
     METRIC="$(conf_get auto_compact_metric)"; [ -n "$METRIC" ] || METRIC="msgs"
     CONTINUE_MSG="$(conf_get resume_continue)"
 
@@ -483,11 +483,15 @@ while true; do
         # stays on the big session. Behavior 2 re-arms only once the size is CONFIRMED down
         # for REARM_GRACE. Drop the stale pre-compaction .ctx and stamp the floor so a last
         # high render from the old session can't re-trigger before the fork reports its size.
+        # 1b can only see a resume land in a pane that exports its size (its .ctx, or the
+        # .compacting behavior 2 left after firing on one). Elsewhere it would re-type
+        # /resume every RESUME_RETRY_SECS until RESUME_GIVEUP, now that THRESH has a default.
+        sized=0; { [ -e "$SIGNAL_DIR/$key.ctx" ] || [ -e "$SIGNAL_DIR/$key.compacting" ]; } && sized=1
         rm -f "$SIGNAL_DIR/$key.ctx"; : > "$SIGNAL_DIR/$key.lastauto"
         # Arm confirmation/retry (behavior 1b) so a resume the agent ate gets re-sent until
         # it actually lands. Only when threshold-compact is active — that's the sole path
         # that can tell "landed" from "not" by watching the size fall back under THRESH.
-        if is_num "$THRESH" && [ "$THRESH" -gt 0 ]; then
+        if [ "$sized" = 1 ] && is_num "$THRESH" && [ "$THRESH" -gt 0 ]; then
             printf '%s\t%s\t%s\t%s\n' "$pane" "$fork" "$(date +%s)" "$pserver" > "$SIGNAL_DIR/$key.resumewant"
         fi
     done

@@ -1,5 +1,5 @@
 ---
-description: Auto-/compact this pane once its context reaches N tokens (msgs metric by default; pass ctx for raw context). Off by default; needs the resume daemon running + the statusline context export. Usage: /cc:autocompact N [msgs|ctx] | off
+description: Auto-/compact this pane once its context reaches N tokens (msgs metric by default; pass ctx for raw context). 300000 by default, off disables; needs the resume daemon running + the statusline context export. Usage: /cc:autocompact N [msgs|ctx] | off
 argument-hint: "N [msgs|ctx] | off"
 ---
 

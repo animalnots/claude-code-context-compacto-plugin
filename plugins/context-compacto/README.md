@@ -56,7 +56,7 @@ All commands are namespaced under the plugin's prefix `/cc:` (Claude Code does t
 | `/cc:model1m ID`   | 1M-context summarizer, used when the middle is bigger (e.g. `opus[1m]`) |
 | `/cc:model ID`     | alias for `/cc:model200k` |
 | `/cc:autoresume on\|off` | arm/disarm tmux auto-resume — a daemon types `/resume <fork>` into your pane after each compact (default **off**; see [Auto-resume](#auto-resume-optional-off-by-default)) |
-| `/cc:autocompact N [msgs\|ctx]` | auto-`/compact` this pane once it reaches N tokens (default **off**; see [Autonomous loop](#autonomous-loop-auto-compact--continue--advanced-unattended)) |
+| `/cc:autocompact N [msgs\|ctx]` | auto-`/compact` this pane once it reaches N tokens (default **300000**, `off` disables; see [Autonomous loop](#autonomous-loop-auto-compact--continue--advanced-unattended)) |
 | `/cc:continue MSG\|off` | after an auto-triggered compaction resumes, auto-send MSG (e.g. `continue`) so the task keeps going (default **off**) |
 | `/cc:show`        | print current config |
 | `/cc:reset`       | delete config (revert to defaults) |
@@ -184,7 +184,7 @@ fi
 
 `$CTX` = total context tokens (`.context_window.total_input_tokens` from the JSON Claude Code pipes to the statusline); `$MSG` = whatever "message tokens" figure you display. No export → the loop has nothing to read and never triggers. A PowerShell statusline needs the version in [Windows (psmux)](#windows-psmux).
 
-**Arm it (both off by default):**
+**Arm it.** With the export above in place the trigger is already on at 300000 by default; the auto-send is off until you set it:
 
 ```
 /cc:autocompact 180000        # compact when msgs (the statusline number) reaches 180k

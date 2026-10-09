@@ -25,7 +25,7 @@ Other (the middle is summarized by a model picked automatically from its size):
   /cc:model1m ID     model when the middle needs 1M context        (e.g. /cc:model1m opus[1m])
   /cc:model ID       alias for /cc:model200k
   /cc:autoresume on|off  after each compact, a daemon types /resume <fork> into your tmux pane (default off)
-  /cc:autocompact N [msgs|ctx]  auto-/compact this pane at N tokens (default off; needs daemon + statusline export)
+  /cc:autocompact N [msgs|ctx]  auto-/compact this pane at N tokens (default 300000, off disables; needs daemon + statusline export)
   /cc:continue MSG|off  after an auto-compacted resume, auto-send MSG e.g. continue (default off)
   /cc:show           print current config
   /cc:reset          clear config (defaults restored)
@@ -48,7 +48,7 @@ Window markers (daemon running, inside tmux): the window option @cc_state is ? w
 
 Mutex per window (last command wins): /cc:begin clears head_pct; /cc:begin-pct clears head_tokens. Same for tail.
 Scope: ~/.claude/precompact.conf is global. Changes apply on the NEXT compact in any session — current, other running, or new. There is no per-session snapshot.
-Defaults: head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]  auto_resume=off  auto_compact_at=off  resume_continue=off
+Defaults: head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]  auto_resume=off  auto_compact_at=300000  resume_continue=off
 Config file: ~/.claude/precompact.conf
 
 Precedence per window (TOKENS beats PCT, env beats file):

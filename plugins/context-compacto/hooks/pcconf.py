@@ -18,7 +18,7 @@ Usage:
     model1m ID   1M-context summarizer model
     model MODEL  alias for model200k
     autoresume on|off  arm/disarm the tmux auto-resume signal (default off)
-    autocompact N [msgs|ctx]  auto-/compact a pane once it reaches N tokens (default off)
+    autocompact N [msgs|ctx]  auto-/compact a pane once it reaches N tokens (default 300000; off stores 0)
     continue MSG|off  message auto-sent after an auto-compacted resume, e.g. continue (default off)
     show         print the current config (or defaults note)
     reset        delete the config file
@@ -26,6 +26,7 @@ Usage:
 
 Percent commands enforce: 0 ≤ N ≤ 100 and head_pct + tail_pct ≤ 100.
 """
+import os
 import pathlib
 import sys
 
@@ -41,6 +42,10 @@ for _stream in (sys.stdout, sys.stderr):
 
 CONF = pathlib.Path.home() / ".claude" / "precompact.conf"
 
+# Threshold in force when the file has no auto_compact_at. compacto-resume-daemon.sh
+# falls back to the same number on its own; change both together.
+AUTO_COMPACT_DEFAULT = 300000
+
 
 def _read_lines():
     if not CONF.exists():
@@ -50,7 +55,11 @@ def _read_lines():
 
 def _write_lines(lines):
     CONF.parent.mkdir(parents=True, exist_ok=True)
-    CONF.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    # The daemon re-reads this file every second, and a half-written one would read as
+    # "no threshold", which means the default rather than off. Write aside, then swap in.
+    tmp = CONF.with_name(CONF.name + ".tmp")
+    tmp.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    os.replace(tmp, CONF)
 
 
 def _set(key, val):
@@ -111,26 +120,37 @@ def _show():
         sys.stdout.write(CONF.read_text(encoding="utf-8"))
     else:
         print("(defaults: head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m])")
-    # These three are "off" by being ABSENT from the file, so dumping the file
-    # alone can't tell "off" from "no such setting". Always spell them out.
+    # auto_resume and resume_continue are "off" by being ABSENT from the file, and an
+    # absent auto_compact_at means the default threshold, so dumping the file alone
+    # can't tell what is in force. Always spell them out.
     conf = _read_conf()
     print("automation:  auto_resume={}  auto_compact_at={} ({})  resume_continue={}".format(
         "on" if conf.get("auto_resume") else "off",
-        conf.get("auto_compact_at") or "off",
+        _auto_compact_state(conf),
         conf.get("auto_compact_metric") or "msgs",
         conf.get("resume_continue") or "off",
     ))
 
 
-def _report_state(key, usage, extra=None):
+def _auto_compact_state(conf):
+    """The threshold in force: no value means the default, a stored 0 means off."""
+    cur = conf.get("auto_compact_at")
+    if not cur:
+        return "{} (default)".format(AUTO_COMPACT_DEFAULT)
+    return "off" if cur == "0" else cur
+
+
+def _report_state(key, usage, extra=None, state=None):
     """Bare command → report current state + usage, and change nothing.
 
     Treating a missing argument as "off" meant a bare word silently disarmed an
     automation, and since off is stored as an absent key, the config printed
     afterwards showed no trace of it either.
     """
-    cur = _read_conf().get(key)
-    print("{} is {}".format(key, "off" if not cur else ("on" if cur == "1" else cur)))
+    if state is None:
+        cur = _read_conf().get(key)
+        state = "off" if not cur else ("on" if cur == "1" else cur)
+    print("{} is {}".format(key, state))
     if extra:
         print(extra)
     print(usage)
@@ -162,7 +182,7 @@ Other (the middle is summarized by a model picked automatically from its size):
   /cc:model1m ID     model when the middle needs 1M context        (e.g. /cc:model1m opus[1m])
   /cc:model ID       alias for /cc:model200k
   /cc:autoresume on|off  after each compact, a daemon types /resume <fork> into your tmux pane (default off)
-  /cc:autocompact N [msgs|ctx]  auto-/compact this pane at N tokens; needs the daemon + statusline export (default off)
+  /cc:autocompact N [msgs|ctx]  auto-/compact this pane at N tokens; needs the daemon + statusline export (default 300000; off disables)
   /cc:continue MSG|off  after an auto-compacted resume, auto-send MSG (e.g. continue) so the task keeps going (default off)
   /cc:show           print current config
   /cc:reset          clear config (defaults restored)
@@ -200,7 +220,7 @@ Scope: ~/.claude/precompact.conf is GLOBAL. Edits take effect on the NEXT compac
   in any session — current, other running sessions, or future ones. No per-session
   snapshot. Env vars (if set) override the file for that shell.
 
-Defaults (no config, no env): head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]  auto_resume=off  auto_compact_at=off  resume_continue=off
+Defaults (no config, no env): head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]  auto_resume=off  auto_compact_at=300000  resume_continue=off
 Config file: ~/.claude/precompact.conf
 
 Precedence per window (head and tail resolved independently):
@@ -296,10 +316,12 @@ def main():
                 "usage: /cc:autocompact N [msgs|ctx] | off   (N = token threshold)",
                 extra="auto_compact_metric is {}".format(
                     _read_conf().get("auto_compact_metric") or "msgs"),
+                state=_auto_compact_state(_read_conf()),
             )
             return
+        # Off is a stored 0: with the key missing the default threshold applies.
         if val in ("off", "0"):
-            _clear("auto_compact_at")
+            _set("auto_compact_at", "0")
         else:
             try:
                 n = int(val)
@@ -307,7 +329,7 @@ def main():
                 sys.stdout.write("usage: /cc:autocompact N [msgs|ctx] | off   (N = token threshold)\n")
                 return
             if n <= 0:
-                _clear("auto_compact_at")
+                _set("auto_compact_at", "0")
             else:
                 _set("auto_compact_at", str(n))
                 metric = (sys.argv[3] if len(sys.argv) > 3 else "").strip().lower()
