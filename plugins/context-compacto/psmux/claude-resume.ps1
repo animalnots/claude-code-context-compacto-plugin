@@ -56,6 +56,16 @@ function Get-PsmuxOption([string]$Name, [string]$Default) {
     return $Default
 }
 
+# psmux-resurrect needs PowerShell 7. A hook gets the PATH psmux started with, which can lack the WindowsApps
+# folder holding the Store pwsh's launcher; psmux then quietly runs the hook in Windows PowerShell instead.
+function Get-Pwsh {
+    $c = Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($c) { return $c.Source }
+    foreach ($p in (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe'), (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe')) {
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
+}
+
 # Sessions other than psmux's own standby (__warm__ and the like).
 function Get-UserSessions {
     $names = & $PSMUX list-sessions -F '#{session_name}' 2>$null
@@ -186,14 +196,24 @@ function Invoke-Resume {
     }
 }
 
+# Never throws: a failed save or restore is logged and the caller goes on to the Claude part.
+function Invoke-Resurrect([string]$Name) {
+    try {
+        $file = Join-Path $ResurrectScripts "$Name.ps1"
+        if (-not (Test-Path -LiteralPath $file)) { Write-Log "${Name}: psmux-resurrect is not installed"; return }
+        $pwsh = Get-Pwsh
+        if (-not $pwsh) { Write-Log "${Name}: skipped, PowerShell 7 (pwsh) not found"; return }
+        $out = & $pwsh -NoProfile -File $file 2>&1 | Out-String
+        if ($LASTEXITCODE) { Write-Log ('{0}: psmux-resurrect exited {1}: {2}' -f $Name, $LASTEXITCODE, ($out.Trim() -split "`n")[-1]) }
+    } catch { Write-Log "${Name}: $_" }
+}
+
 function Invoke-Restore {
     if ((Get-PsmuxOption '@claude-resume-restore' 'on') -eq 'off') { return }
     $sessions = @(Get-UserSessions)
     if ($sessions.Count -gt 1 -and -not $Force) { Write-Log "restore: skipped, psmux was already running ($($sessions -join ', '))"; return }
     Write-Log "restore: fresh start ($($sessions -join ', '))"
-    $restoreScript = Join-Path $ResurrectScripts 'restore.ps1'
-    if (Test-Path -LiteralPath $restoreScript) { & pwsh -NoProfile -File $restoreScript *>&1 | Out-Null }
-    else { Write-Log 'restore: psmux-resurrect is not installed, only resuming Claude' }
+    Invoke-Resurrect 'restore'
     Invoke-Resume
 }
 
@@ -214,9 +234,9 @@ function Invoke-Loop {
             $due = (Get-Date).AddMinutes($minutes)
             while ((Get-Date) -lt $due -and @(Get-UserSessions).Count) { Start-Sleep -Seconds ([Math]::Min(10, [Math]::Max(1, ($due - (Get-Date)).TotalSeconds))) }
             if (-not @(Get-UserSessions).Count) { Write-Log 'loop: no psmux session left, stopping'; break }
-            $saveScript = Join-Path $ResurrectScripts 'save.ps1'
-            if (Test-Path -LiteralPath $saveScript) { & pwsh -NoProfile -File $saveScript *>&1 | Out-Null }
-            Save-Snapshot
+            Invoke-Resurrect 'save'
+            # An error escaping here would end the loop, and with it all saving until psmux restarts.
+            try { Save-Snapshot } catch { Write-Log "snapshot: $_" }
         }
     } finally {
         try { $mutex.ReleaseMutex() } catch {}
