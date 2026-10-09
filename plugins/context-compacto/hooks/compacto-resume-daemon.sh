@@ -23,7 +23,7 @@
 #      going. UNBOUNDED — runs until you stop this daemon. Only fires for compacts
 #      THIS daemon triggered (behavior 2), never for a manual /compact.
 #
-#   4. WINDOW MARKERS (always): sets the tmux window option @cc_state on windows running
+#   4. WINDOW MARKERS (always; not on psmux): sets the tmux window option @cc_state on windows running
 #      Claude: "?" a question/permission/trust dialog waits for you, "$" Claude finished
 #      while you weren't viewing the window, "&" idle but background agents or shells are
 #      still running. Invisible unless window-status-format prints #{@cc_state} (see README).
@@ -46,8 +46,13 @@
 #   COMPACTO_MAX_COMPACT_FAILS  genuine /compact failures before a pane is treated as wedged (default 3)
 #   COMPACTO_WEDGE_BACKOFF    retry interval (secs) once a pane is wedged (default 1800)
 #
-# Assumes a single tmux server; pane ids are unique per server.
+# Assumes a single tmux server; pane ids are unique per server. psmux (Windows) runs a server per
+# session instead, so there panes are addressed through their session (see pane_target).
 set -u
+
+# Git Bash rewrites arguments that look like POSIX paths when it starts a Windows program, so
+# send-keys "/compact" would type "C:/Program Files/Git/compact". No effect outside MSYS.
+export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 
 SIGNAL_DIR="${COMPACTO_SIGNAL_DIR:-$HOME/.claude/compacto-signals}"
 POLL="${COMPACTO_POLL_SECS:-1}"
@@ -85,7 +90,10 @@ DEBUG="${COMPACTO_DEBUG:-}"                      # set to 1 to log pane state at
 CONF="$HOME/.claude/precompact.conf"
 
 command -v ${TMUX_CMD%% *} >/dev/null 2>&1 || { echo "compacto-resume-daemon: '${TMUX_CMD%% *}' not found on PATH" >&2; exit 1; }
+ON_PSMUX=0; $TMUX_CMD -V 2>/dev/null | grep -qi psmux && ON_PSMUX=1
 mkdir -p "$SIGNAL_DIR"
+# Command line of pid $1: /proc where it exists (Linux; Git Bash, whose ps has no -o), else ps (macOS).
+proc_cmdline() { if [ -r "/proc/$1/cmdline" ]; then tr '\0' ' ' < "/proc/$1/cmdline"; else ps -p "$1" -o command= 2>/dev/null; fi; }
 
 # Single-instance lock. launchd (KeepAlive) plus a stray manual start would otherwise run
 # two pollers that both fire /compact and /resume into the same panes — a self-inflicted
@@ -97,7 +105,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then
     holder="$(cat "$LOCK/pid" 2>/dev/null)"
     # kill -0 alone isn't enough: after a reboot the lock dir survives on disk and the
     # holder pid can be recycled by an unrelated process. Require the name to match too.
-    if [ -n "${holder:-}" ] && ps -p "$holder" -o command= 2>/dev/null | grep -q compacto-resume-daemon; then
+    if [ -n "${holder:-}" ] && proc_cmdline "$holder" | grep -q compacto-resume-daemon; then
         echo "compacto-resume-daemon: already running (pid $holder); this instance is exiting." >&2
         exit 0
     fi
@@ -110,6 +118,15 @@ trap 'clear_markers; rm -rf "$LOCK"; echo "compacto-resume-daemon: stopped."; ex
 conf_get() { [ -f "$CONF" ] && grep -E "^$1=" "$CONF" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
 is_num()   { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 pane_alive() { $TMUX_CMD list-panes -a -F '#{pane_id}' 2>/dev/null | grep -Fxq "$1"; }
+# -t target for pane $1, or status 1 if it's gone, 2 if ambiguous. psmux runs a server per session with
+# its own %N numbering, and a command for a closed session's %N lands in another session's pane, so there
+# a pane is "=<session>:.%N" (which fails instead), picked by the server pid $2 its writer recorded.
+pane_target() {
+    if [ "$ON_PSMUX" != 1 ]; then pane_alive "$1" && printf '%s' "$1"; return; fi
+    $TMUX_CMD list-panes -a -F '#{pid} #{pane_id} #{session_name}' 2>/dev/null | awk -v id="$1" -v pid="${2:-}" '
+        $2 == id && (pid == "" || $1 == pid) { n++; s = $0; sub(/^[^ ]+ [^ ]+ /, "", s) }
+        END { if (n == 1) printf "=%s:.%s", s, id; exit (n == 1 ? 0 : (n ? 2 : 1)) }'
+}
 # Classifies a Claude screen (capture-pane output on stdin) for both the typing gate and the
 # window markers: busy, ready (the plain input box), background (that box while background
 # agents or shells still run), dialog (a question/permission/trust dialog) or unknown.
@@ -126,8 +143,8 @@ function classify(    first, i, s, busy, box, footer, bg) {
         if (tolower(s) ~ tolower(ENVIRON["BUSY_REGEX"]) || tolower(s) ~ /queued message/) busy = 1
         # Bypass-permissions mode never shows "esc to interrupt"; the spinner line
         # "✳ Scurrying… (3m 53s · ↓ 24.5k tokens)" is its only busy marker. Column 0 and not a ⏺
-        # message line, so prose quoting it doesn't count; a finished turn reads "✻ Baked for 5m 16s".
-        if (s ~ /^[^ ]+ [^()]+… \([0-9]+[hms]/ && s !~ /^⏺/) busy = 1
+        # message line (● on Windows), so prose quoting it doesn't count; a finished turn reads "✻ Baked for 5m 16s".
+        if (s ~ /^[^ ]+ [^()]+… \([0-9]+[hms]/ && s !~ /^(⏺|●)/) busy = 1
         # Type only into the plain input box, whose "❯" line sits directly under a "───" rule. A
         # question, permission or trust dialog replaces the box and puts its "❯ 1." cursor under
         # the question text, where the Enter we send would pick option 1 for the user.
@@ -146,7 +163,7 @@ function classify(    first, i, s, busy, box, footer, bg) {
     for (i = first; i <= last; i++) {
         s = line[i]
         if (i > box && s ~ /^───/) footer = 1
-        if (s ~ /^(⏺|❯)/) continue
+        if (s ~ /^(⏺|●|❯)/) continue
         if (s ~ /^[^ ]+ Waiting for [0-9]+ background agents? to finish/ || s ~ /^[^ ]+ .*[0-9]+ shells? still running/) bg = 1
         if (footer && s ~ /· [0-9]+ shells?( |$)/) bg = 1
     }
@@ -189,7 +206,9 @@ pane_autocompact_optout() { [[ "$($TMUX_CMD display-message -p -t "$1" '#{window
 # here. Reconcile against the executions ledger compactions.log written by precompact.py:
 # a "fire" with no matching execution line = the /compact was eaten or is still queued.
 evlog() { echo "$(date '+%F %T') $*" >> "$SIGNAL_DIR/events.log" 2>/dev/null || true; }
-file_age()   { local f="$1" m; m=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0); echo $(( $(date +%s) - m )); }
+# GNU stat first: its -f means "file system" and prints a status block before failing on "%m",
+# and that block would land in $m.
+file_age()   { local f="$1" m; m=$(stat -c %Y "$f" 2>/dev/null) || m=$(stat -f %m "$f" 2>/dev/null) || m=0; echo $(( $(date +%s) - m )); }
 
 # Behavior 4 keeps per-pane memory indexed by pane number (%12 -> 12). It starts empty, so
 # after a daemon restart, panes that are already idle count as seen.
@@ -261,6 +280,7 @@ update_markers() {
     return 0
 }
 clear_markers() {
+    [ "$ON_PSMUX" = 1 ] && return 0                 # markers are off there (see markers_wanted)
     local w m
     while read -r w m; do
         [ -n "$m" ] && $TMUX_CMD set-option -wu -t "$w" @cc_state
@@ -270,6 +290,9 @@ clear_markers() {
 # option mentions it. Re-checked every 30s: adding the format lines turns markers on.
 MARKERS_CHECKED_AT=0; MARKERS_WANTED=0
 markers_wanted() {
+    # psmux runs only the first command of a ";" chain and never updates window_activity, and the
+    # pane read below depends on both.
+    [ "$ON_PSMUX" = 1 ] && return 1
     local now="${EPOCHSECONDS:-$(date +%s)}"
     if [ $((now - MARKERS_CHECKED_AT)) -ge 30 ]; then
         MARKERS_CHECKED_AT=$now; MARKERS_WANTED=0
@@ -290,13 +313,17 @@ while true; do
     if is_num "$THRESH" && [ "$THRESH" -gt 0 ]; then
         for cf in "$SIGNAL_DIR"/*.ctx; do
             [ -e "$cf" ] || continue
-            IFS=$'\t' read -r cpane cctx cmsg < "$cf"
+            # 4th field: the psmux server pid (see pane_target). Windows writers may end lines with CRLF.
+            IFS=$'\t' read -r cpane cctx cmsg cserver < "$cf"
+            cpane="${cpane%$'\r'}"; cctx="${cctx%$'\r'}"; cmsg="${cmsg%$'\r'}"; cserver="${cserver%$'\r'}"
             [ -n "${cpane:-}" ] || continue
-            key="${cpane//[^a-zA-Z0-9]/}"
-            if ! pane_alive "$cpane"; then          # session closed -> clean up its files
+            key="${cf##*/}"; key="${key%.ctx}"      # the writer's key; on psmux it includes the server
+            ctgt="$(pane_target "${cpane}" "$cserver")"; rc=$?
+            if [ "$rc" = 1 ]; then                  # session closed -> clean up its files
                 rm -f "$cf" "$SIGNAL_DIR/$key.compacting" "$SIGNAL_DIR/$key.await-continue" "$SIGNAL_DIR/$key.lastauto" "$SIGNAL_DIR/$key.belowsince" "$SIGNAL_DIR/$key.resumewant" "$SIGNAL_DIR/$key.failcount"
                 continue
             fi
+            [ "$rc" = 0 ] || continue               # same %N in several psmux sessions, no server pid to pick one
             # A fork from the last /compact is still waiting to be resumed. Do NOT fire a
             # second /compact on top of it — that stacks compactions and buries the resume
             # behind them. .compacting (set below) holds until the size is confirmed durably
@@ -350,47 +377,47 @@ while true; do
                 # its input so /compact can't run). Past MAX_FAILS, stop probing every COOLDOWN
                 # — stretch to WEDGE_BACKOFF so we're not shoving /compact into a stuck pane.
                 gate="$COOLDOWN"; [ "$n" -ge "$MAX_FAILS" ] && gate="$WEDGE_BACKOFF"
-                if [ "$(file_age "$cm")" -gt "$gate" ] && pane_idle "$cpane" && ! pane_pending_compact "$cpane"; then
+                if [ "$(file_age "$cm")" -gt "$gate" ] && pane_idle "$ctgt" && ! pane_pending_compact "$ctgt"; then
                     rm -f "$cm"
                     n=$((n + 1)); echo "$n" > "$fc"
                     if [ "$n" -eq "$MAX_FAILS" ]; then
                         # ${n} must stay braced: bash pulls the multibyte × into a bare $n's
                         # name, and under set -u that unset "n×" variable killed the daemon.
-                        echo "compacto-resume-daemon: pane $cpane WEDGED — /compact fired ${n}× but never executed (likely stuck queued input); backing off to ${WEDGE_BACKOFF}s. Clear the pane to recover." >&2
-                        evlog "WEDGED $cpane fails=$n backoff=${WEDGE_BACKOFF}s"
+                        echo "compacto-resume-daemon: pane $ctgt WEDGED — /compact fired ${n}× but never executed (likely stuck queued input); backing off to ${WEDGE_BACKOFF}s. Clear the pane to recover." >&2
+                        evlog "WEDGED $ctgt fails=$n backoff=${WEDGE_BACKOFF}s"
                     else
-                        [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: release .compacting $cpane — idle+oversized ${gate}s, no fork (genuine fail #$n; will retry)" >&2
-                        evlog "release $cpane fail#$n age>$gate"
+                        [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: release .compacting $ctgt — idle+oversized ${gate}s, no fork (genuine fail #$n; will retry)" >&2
+                        evlog "release $ctgt fail#$n age>$gate"
                     fi
                 else
-                    [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: suppress $cpane val=$val — compaction in flight/queued ($(file_age "$cm")s, fails=$n)" >&2
+                    [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: suppress $ctgt val=$val — compaction in flight/queued ($(file_age "$cm")s, fails=$n)" >&2
                     continue
                 fi
             fi
-            if pane_autocompact_optout "$cpane"; then
-                [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: skip $cpane val=$val — '!' in window name (auto-compact opt-out)" >&2
+            if pane_autocompact_optout "$ctgt"; then
+                [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: skip $ctgt val=$val — '!' in window name (auto-compact opt-out)" >&2
                 continue
             fi
-            if ! pane_idle "$cpane"; then           # never interrupt an in-progress turn
-                [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: skip $cpane val=$val — pane busy or not at a plain prompt (working, queued input, or a dialog open)" >&2
+            if ! pane_idle "$ctgt"; then           # never interrupt an in-progress turn
+                [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: skip $ctgt val=$val — pane busy or not at a plain prompt (working, queued input, or a dialog open)" >&2
                 continue
             fi
             # Belt-and-braces independent of marker state: if a /compact is already visibly
             # queued in this pane, another one can only stack behind it.
-            if pane_pending_compact "$cpane"; then
-                [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: skip $cpane val=$val — a /compact is already queued in the pane" >&2
+            if pane_pending_compact "$ctgt"; then
+                [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: skip $ctgt val=$val — a /compact is already queued in the pane" >&2
                 continue
             fi
 
             if [ -n "$DEBUG" ]; then
-                echo "compacto-resume-daemon[dbg]: fire $cpane val=$val in_mode=$($TMUX_CMD display-message -p -t "$cpane" '#{pane_in_mode}' 2>/dev/null) tail=[$($TMUX_CMD capture-pane -p -t "$cpane" 2>/dev/null | grep -vE '^\s*$' | tail -1 | cut -c1-60)]" >&2
+                echo "compacto-resume-daemon[dbg]: fire $ctgt val=$val in_mode=$($TMUX_CMD display-message -p -t "$ctgt" '#{pane_in_mode}' 2>/dev/null) tail=[$($TMUX_CMD capture-pane -p -t "$ctgt" 2>/dev/null | grep -vE '^\s*$' | tail -1 | cut -c1-60)]" >&2
             fi
-            $TMUX_CMD send-keys -t "$cpane" "/compact" Enter
-            evlog "fire $cpane $METRIC=$val"
+            $TMUX_CMD send-keys -t "$ctgt" "/compact" Enter
+            evlog "fire $ctgt $METRIC=$val"
             : > "$cm"; : > "$la"; unset "PANE_CONTINUED[${cpane#%}]"
             [ -n "$CONTINUE_MSG" ] && : > "$SIGNAL_DIR/$key.await-continue"
             rm -f "$cf"    # consume this reading; .compacting debounces until the fork resumes
-            echo "compacto-resume-daemon: auto-compact $cpane ($METRIC=$val >= $THRESH)"
+            echo "compacto-resume-daemon: auto-compact $ctgt ($METRIC=$val >= $THRESH)"
         done
     fi
 
@@ -399,18 +426,21 @@ while true; do
         [ -e "$f" ] || continue
         busy="$f.busy"
         mv "$f" "$busy" 2>/dev/null || continue     # claim atomically
-        IFS=$'\t' read -r pane fork < "$busy"
+        # 3rd field: the psmux server pid (see pane_target). The hook on Windows may write CRLF.
+        IFS=$'\t' read -r pane fork pserver < "$busy"
+        fork="${fork%$'\r'}"; pserver="${pserver%$'\r'}"
         if [ -z "${pane:-}" ] || [ -z "${fork:-}" ]; then
             rm -f "$busy"
             echo "compacto-resume-daemon: malformed signal skipped (pane='${pane:-}' fork='${fork:-}')" >&2
             continue
         fi
-        key="${pane//[^a-zA-Z0-9]/}"
+        key="${f##*/}"; key="${key%.resume}"
         # .compacting is NOT cleared in this loop at all — only behavior 2 clears it, and
         # only after the pane's size is confirmed durably below the threshold. That way a
         # /resume that doesn't actually land can't re-arm a second /compact.
 
-        if ! pane_alive "$pane"; then
+        ptgt="$(pane_target "$pane" "$pserver")"; rc=$?
+        if [ "$rc" = 1 ]; then
             rm -f "$busy" "$SIGNAL_DIR/$key.await-continue" "$SIGNAL_DIR/$key.lastauto"
             echo "compacto-resume-daemon: pane $pane gone; dropped resume $fork" >&2
             continue
@@ -421,7 +451,7 @@ while true; do
         # and retry on the next poll until the pane is back at a ready prompt. Same
         # guard behavior 2 uses before /compact, so we also never yank the session
         # out from under a turn the user started.
-        if ! pane_idle "$pane"; then
+        if [ "$rc" != 0 ] || ! pane_idle "$ptgt"; then
             mv "$busy" "$f" 2>/dev/null || rm -f "$busy"
             continue
         fi
@@ -433,18 +463,19 @@ while true; do
         # so the pane stays on the big pre-compact session; behavior 2 then re-compacts it
         # ~a minute later, and the first fork is orphaned. If the pane went busy, restore
         # the signal and retry on a later idle frame instead of firing a resume that's lost.
-        if ! pane_alive "$pane"; then
+        ptgt="$(pane_target "$pane" "$pserver")"; rc=$?
+        if [ "$rc" = 1 ]; then
             rm -f "$busy" "$SIGNAL_DIR/$key.await-continue" "$SIGNAL_DIR/$key.lastauto"
             continue
         fi
-        if ! pane_idle "$pane"; then
+        if [ "$rc" != 0 ] || ! pane_idle "$ptgt"; then
             mv "$busy" "$f" 2>/dev/null || rm -f "$busy"
             continue
         fi
         rm -f "$busy"
-        $TMUX_CMD send-keys -t "$pane" "/resume $fork" Enter
-        echo "compacto-resume-daemon: resumed $fork in pane $pane"
-        evlog "resume-sent $pane $fork"
+        $TMUX_CMD send-keys -t "$ptgt" "/resume $fork" Enter
+        echo "compacto-resume-daemon: resumed $fork in pane $ptgt"
+        evlog "resume-sent $ptgt $fork"
         # Deliberately do NOT clear .compacting here. Sending /resume is not proof it landed
         # — on a busy autonomous pane the keystroke can be queued or dropped and the pane
         # stays on the big session. Behavior 2 re-arms only once the size is CONFIRMED down
@@ -455,7 +486,7 @@ while true; do
         # it actually lands. Only when threshold-compact is active — that's the sole path
         # that can tell "landed" from "not" by watching the size fall back under THRESH.
         if is_num "$THRESH" && [ "$THRESH" -gt 0 ]; then
-            printf '%s\t%s\t%s\n' "$pane" "$fork" "$(date +%s)" > "$SIGNAL_DIR/$key.resumewant"
+            printf '%s\t%s\t%s\t%s\n' "$pane" "$fork" "$(date +%s)" "$pserver" > "$SIGNAL_DIR/$key.resumewant"
         fi
     done
 
@@ -466,26 +497,28 @@ while true; do
     # continue. Give up after RESUME_GIVEUP so a wedged pane falls back to behavior 2.
     for w in "$SIGNAL_DIR"/*.resumewant; do
         [ -e "$w" ] || continue
-        IFS=$'\t' read -r rpane rfork rsince < "$w"
+        IFS=$'\t' read -r rpane rfork rsince rserver < "$w"
         [ -n "${rpane:-}" ] && [ -n "${rfork:-}" ] || { rm -f "$w"; continue; }
-        rkey="${rpane//[^a-zA-Z0-9]/}"
+        rkey="${w##*/}"; rkey="${rkey%.resumewant}"
         if ! is_num "$THRESH" || [ "$THRESH" -le 0 ]; then rm -f "$w"; continue; fi   # can't confirm without a threshold
-        if ! pane_alive "$rpane"; then rm -f "$w" "$SIGNAL_DIR/$rkey.await-continue"; continue; fi
+        rtgt="$(pane_target "${rpane}" "${rserver:-}")"; rc=$?
+        if [ "$rc" = 1 ]; then rm -f "$w" "$SIGNAL_DIR/$rkey.await-continue"; continue; fi
+        [ "$rc" = 0 ] || continue
 
         # Confirmed when the fork's own render reports a size back under the threshold.
         rcf="$SIGNAL_DIR/$rkey.ctx"
         if [ -e "$rcf" ]; then
-            IFS=$'\t' read -r _ rctx rmsg < "$rcf"
+            IFS=$'\t' read -r _ rctx rmsg _ < "$rcf"; rctx="${rctx%$'\r'}"; rmsg="${rmsg%$'\r'}"
             case "$METRIC" in ctx) rval="${rctx:-0}";; *) rval="${rmsg:-0}";; esac
             if is_num "$rval" && [ "$rval" -lt "$THRESH" ]; then
                 rm -f "$w"
-                echo "compacto-resume-daemon: resume confirmed for $rpane ($METRIC=$rval)"
-                evlog "resume-confirmed $rpane $METRIC=$rval"
+                echo "compacto-resume-daemon: resume confirmed for $rtgt ($METRIC=$rval)"
+                evlog "resume-confirmed $rtgt $METRIC=$rval"
                 ac="$SIGNAL_DIR/$rkey.await-continue"
-                if [ -e "$ac" ] && [ -n "$CONTINUE_MSG" ] && pane_idle "$rpane"; then
-                    $TMUX_CMD send-keys -t "$rpane" "$CONTINUE_MSG" Enter
+                if [ -e "$ac" ] && [ -n "$CONTINUE_MSG" ] && pane_idle "$rtgt"; then
+                    $TMUX_CMD send-keys -t "$rtgt" "$CONTINUE_MSG" Enter
                     PANE_CONTINUED[${rpane#%}]=1
-                    echo "compacto-resume-daemon: continued $rpane with: $CONTINUE_MSG"
+                    echo "compacto-resume-daemon: continued $rtgt with: $CONTINUE_MSG"
                     rm -f "$ac"
                 fi
                 continue
@@ -495,16 +528,16 @@ while true; do
         now="$(date +%s)"; is_num "${rsince:-}" || rsince="$now"
         if [ "$(( now - rsince ))" -ge "$RESUME_GIVEUP" ]; then
             rm -f "$w" "$SIGNAL_DIR/$rkey.await-continue"
-            echo "compacto-resume-daemon: resume gave up for $rpane after $(( now - rsince ))s ($rfork)" >&2
-            evlog "resume-giveup $rpane $rfork after=$(( now - rsince ))s"
+            echo "compacto-resume-daemon: resume gave up for $rtgt after $(( now - rsince ))s ($rfork)" >&2
+            evlog "resume-giveup $rtgt $rfork after=$(( now - rsince ))s"
             continue
         fi
         # Re-send, paced by the marker's mtime, only into an idle frame.
-        if [ "$(file_age "$w")" -ge "$RESUME_RETRY_SECS" ] && pane_idle "$rpane"; then
-            $TMUX_CMD send-keys -t "$rpane" "/resume $rfork" Enter
+        if [ "$(file_age "$w")" -ge "$RESUME_RETRY_SECS" ] && pane_idle "$rtgt"; then
+            $TMUX_CMD send-keys -t "$rtgt" "/resume $rfork" Enter
             touch "$w"
-            echo "compacto-resume-daemon: resume retry for $rpane ($rfork)"
-            evlog "resume-retry $rpane $rfork"
+            echo "compacto-resume-daemon: resume retry for $rtgt ($rfork)"
+            evlog "resume-retry $rtgt $rfork"
         fi
     done
 

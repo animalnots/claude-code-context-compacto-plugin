@@ -58,6 +58,7 @@ import datetime
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -127,6 +128,10 @@ def _truthy(v):
 # sessions each resume their own window and never cross-wire.
 AUTO_RESUME = _truthy(os.environ.get("PRECOMPACT_AUTO_RESUME"))
 TMUX_PANE = os.environ.get("TMUX_PANE", "")
+# psmux (Windows tmux) runs a server per session and numbers panes per server, so "%1" repeats
+# across sessions. There the server pid from $TMUX qualifies the signal's key and rides in it.
+_psmux = re.search(r"psmux-(\d+)", os.environ.get("TMUX", "").split(",")[0])
+PSMUX_SERVER = _psmux.group(1) if _psmux else ""
 # Same env var the daemon reads, so one export aims both sides at one directory.
 # Needed when the hook's Python and the daemon's shell disagree about home —
 # e.g. Windows Python's C:\Users\x vs a POSIX shell's /home/x.
@@ -512,11 +517,15 @@ if fork_id and AUTO_RESUME:
         try:
             SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
             pane_key = "".join(c for c in TMUX_PANE if c.isalnum()) or "pane"
+            if PSMUX_SERVER:
+                pane_key = f"{PSMUX_SERVER}_{pane_key}"
             sig = SIGNAL_DIR / f"{pane_key}.resume"
             tmp = SIGNAL_DIR / f"{pane_key}.resume.tmp"
-            # Line is  <exact-pane-id>\t<fork-id>  — the daemon targets the pane
-            # verbatim and never has to reconstruct it from the filename.
-            tmp.write_text(f"{TMUX_PANE}\t{fork_id}\n", encoding="utf-8")
+            # Line is  <exact-pane-id>\t<fork-id>[\t<psmux-server-pid>]  — the daemon targets the
+            # pane verbatim and never has to reconstruct it from the filename. Bytes, because
+            # text mode on Windows would end the line with CRLF.
+            line = f"{TMUX_PANE}\t{fork_id}" + (f"\t{PSMUX_SERVER}" if PSMUX_SERVER else "") + "\n"
+            tmp.write_bytes(line.encode("utf-8"))
             os.replace(tmp, sig)
             autoresume_note = f"Auto-resume armed for tmux pane {TMUX_PANE} (needs compacto-resume-daemon.sh running)."
         except Exception as e:
