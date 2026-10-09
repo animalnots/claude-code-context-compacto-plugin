@@ -162,7 +162,7 @@ Automates that one keystroke. When armed, after every compaction a small daemon 
 
 > Timing: a compaction returns you to an idle prompt, which is when the daemon types `/resume` — safe. If you manually `/compact` with half a line already typed, the injected `/resume` can interleave with it; v1 doesn't guard that edge.
 >
-> Assumes a single default tmux server (pane ids are unique per server).
+> Assumes a single default tmux server (pane ids are unique per server). psmux on Windows is handled separately, see [Windows (psmux)](#windows-psmux).
 
 ## Autonomous loop (auto-compact + continue) — advanced, unattended
 
@@ -182,7 +182,7 @@ if [ -n "${TMUX_PANE:-}" ]; then
 fi
 ```
 
-`$CTX` = total context tokens (`.context_window.total_input_tokens` from the JSON Claude Code pipes to the statusline); `$MSG` = whatever "message tokens" figure you display. No export → the loop has nothing to read and never triggers.
+`$CTX` = total context tokens (`.context_window.total_input_tokens` from the JSON Claude Code pipes to the statusline); `$MSG` = whatever "message tokens" figure you display. No export → the loop has nothing to read and never triggers. A PowerShell statusline needs the version in [Windows (psmux)](#windows-psmux).
 
 **Arm it (both off by default):**
 
@@ -238,6 +238,42 @@ COMPACTO_POLL_SECS=1                     # poll interval
 ```
 
 Config keys (in `~/.claude/precompact.conf`, read live on every poll): `auto_compact_at`, `auto_compact_metric` (`msgs` | `ctx`), `resume_continue`.
+
+## Windows (psmux)
+
+Auto-resume and the autonomous loop also run on native Windows inside [psmux](https://github.com/psmux/psmux), a Windows tmux. It installs a `tmux` command, so the hook and the daemon find it as is. What differs:
+
+- **The daemon runs in Git Bash.** Inside psmux the SessionStart hook starts it for you with the `bash.exe` next to `git.exe` (set `COMPACTO_BASH` to use another one): a bare `bash` on Windows is the WSL launcher. To start it by hand from a psmux pane:
+
+  ```powershell
+  & 'C:\Program Files\Git\bin\bash.exe' "$HOME\.claude\plugins\cache\context-compacto-marketplace\cc\<version>\hooks\compacto-resume-daemon.sh"
+  ```
+
+- **The statusline export in PowerShell.** Insert after your script computes the two numbers (`$CTX` = total context tokens, `$MSG` = the msgs figure you display):
+
+  ```powershell
+  # --- context-compacto: export live context size for the auto-compact watcher ---
+  if ($env:TMUX_PANE) {
+      try {
+          $sig = Join-Path $HOME '.claude/compacto-signals'
+          New-Item -ItemType Directory -Force -Path $sig | Out-Null
+          $key  = $env:TMUX_PANE -replace '[^a-zA-Z0-9]', ''
+          $line = "{0}`t{1}`t{2}" -f $env:TMUX_PANE, [int64]$CTX, [int64]$MSG
+          # psmux numbers panes per session, so its server pid (in $TMUX) joins the key and the line.
+          if ($env:TMUX -match 'psmux-(\d+)') { $key = "$($Matches[1])_$key"; $line += "`t$($Matches[1])" }
+          $tmp = Join-Path $sig "$key.ctx.tmp"
+          # No BOM (it would glue onto the pane id), hence WriteAllText rather than Out-File.
+          [System.IO.File]::WriteAllText($tmp, "$line`n", (New-Object System.Text.UTF8Encoding($false)))
+          Move-Item -Force -Path $tmp -Destination (Join-Path $sig "$key.ctx")
+      } catch { }
+  }
+  ```
+
+  No PowerShell statusline yet? Copy [`examples/statusline-command.ps1`](examples/statusline-command.ps1) outside the plugin cache and point `statusLine.command` at it by absolute path; `${CLAUDE_PLUGIN_ROOT}` doesn't expand there.
+
+- **Several psmux sessions are fine.** psmux runs a server per session and numbers panes per server, so `%1` exists in every session, and a command aimed at a closed session's `%1` lands in another session's pane. So on psmux the hook and the export above add the server pid (from `$TMUX`) to each signal, and the daemon addresses a pane as `=<session>:.%N`, which fails instead of falling through. A signal without the pid, from an older export, is acted on only while its `%N` exists in a single session.
+- **Window markers are off on psmux:** it runs only the first command of a `;` chain and never updates `window_activity`.
+- **Faster polling (optional):** `COMPACTO_TMUX=/c/ProgramData/chocolatey/lib/psmux/tools/tmux.exe` skips the Chocolatey shim, roughly halving each tmux call.
 
 ## Requirements
 
