@@ -147,11 +147,19 @@ function classify(    first, i, s, busy, box, footer, bg) {
         if (s ~ /^[^ ]+ [^()]+… \([0-9]+[hms]/ && s !~ /^(⏺|●)/) busy = 1
         # Type only into the plain input box, whose "❯" line sits directly under a "───" rule. A
         # question, permission or trust dialog replaces the box and puts its "❯ 1." cursor under
-        # the question text, where the Enter we send would pick option 1 for the user.
-        if (s ~ /^❯/) box = (i > first && line[i - 1] ~ /^───/) ? i : 0
+        # the question text, where the Enter we send would pick option 1 for the user. A question's
+        # last option, "❯ 4. Chat about this", does sit under a rule, so a numbered cursor is never
+        # the box. The box puts a no-break space after ❯, so a draft "1. ..." is still the box.
+        if (s ~ /^❯/) box = (i > first && line[i - 1] ~ /^───/ && s !~ /^❯ [0-9]+\. /) ? i : 0
     }
     if (busy) return "busy"
-    if (!box) return (line[last] ~ /Esc to cancel/) ? "dialog" : "unknown"
+    if (!box) {
+        # A session named with /rename keeps its "─── name ─" input border under a question
+        # dialog, below the "Esc to cancel" footer.
+        i = last
+        while (i > first && line[i] ~ /^─/) i--
+        return (line[i] ~ /Esc to cancel/) ? "dialog" : "unknown"
+    }
     # Only a finished turn's status line means idle: "✻ Sautéed for 5m 51s · done 1:11" or
     # "✻ Waiting for 6 background agents to finish". A turn in progress is worded many ways, e.g.
     # "(Checking UI changes… · 30m 43s" or "Waiting for API response · will retry in 2m 40s".
