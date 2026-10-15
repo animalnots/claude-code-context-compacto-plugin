@@ -7,6 +7,13 @@ produces:
   - a compressed fork transcript at <projects-dir>/<new-sid>.jsonl that
     Claude Code can resume via `claude --resume <new-sid>`.
 
+Compactions inside a subagent pass through to Claude Code's native compaction.
+They are recognised by `agent_id` in the payload or, since Claude Code 2.1.300
+doesn't send it, by an auto trigger while the parent's context is under 85% of
+CLAUDE_CODE_AUTO_COMPACT_WINDOW and at least 60k tokens short of it (without that
+variable they are still blocked). An auto compaction in a tmux window whose name
+contains "!" is refused outright, with no fork and no /resume.
+
 Usage:
   python precompact.py [model]
 
@@ -165,10 +172,78 @@ transcript_path = payload.get("transcript_path", "")
 session_id      = payload.get("session_id", "unknown")
 trigger         = payload.get("compaction_trigger") or payload.get("trigger") or "auto"
 
+# A subagent's compaction arrives with the parent session's transcript_path. Blocking it runs the
+# subagent into the context limit, and forking would arm /resume in the parent's pane.
+if payload.get("agent_id"):
+    sys.exit(0)
+
 if not transcript_path or not os.path.exists(transcript_path):
     print(json.dumps({"decision": "block",
                       "reason": f"precompact hook: no transcript at {transcript_path}"}))
     sys.exit(0)
+
+
+def _context_tokens(e):
+    u = (e.get("message") or {}).get("usage") or {}
+    return sum(u.get(k) or 0 for k in ("input_tokens", "cache_creation_input_tokens",
+                                        "cache_read_input_tokens"))
+
+
+def _last_context_tokens(path, tail_bytes=4 << 20):
+    # Tail first: a refused auto compaction repeats on every turn of a big session.
+    with open(path, "rb") as f:
+        size = f.seek(0, os.SEEK_END)
+        for start in ([size - tail_bytes, 0] if size > tail_bytes else [0]):
+            f.seek(start)
+            lines = f.read().splitlines()[1 if start else 0:]
+            for raw in reversed(lines):
+                try:
+                    e = json.loads(raw)
+                except ValueError:
+                    continue
+                if (isinstance(e, dict) and e.get("type") == "assistant"
+                        and not e.get("isSidechain") and _context_tokens(e)):
+                    return _context_tokens(e)
+    return 0
+
+
+def _auto_compact_trigger_tokens():
+    try:
+        window = int(os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW", ""))
+    except ValueError:
+        return None
+    try:
+        pct = min(max(int(os.environ.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "100")), 1), 100)
+    except ValueError:
+        pct = 100
+    return window * pct // 100 if window > 0 else None
+
+
+def _window_opted_out():
+    tmux = shutil.which(os.environ.get("COMPACTO_TMUX") or "tmux")
+    if not (TMUX_PANE and tmux):
+        return False
+    try:
+        name = subprocess.run([tmux, "display-message", "-p", "-t", TMUX_PANE, "#{window_name}"],
+                              capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "!" in name
+
+
+if trigger == "auto":
+    # Claude Code 2.1.300 omits agent_id when a subagent compacts, so infer it: the parent only
+    # auto-compacts about 25-33k short of its window, so a parent well below that means a subagent.
+    trigger_tokens = _auto_compact_trigger_tokens()
+    parent_tokens = _last_context_tokens(transcript_path)
+    if trigger_tokens and 0 < parent_tokens < min(trigger_tokens * 0.85, trigger_tokens - 60000):
+        sys.exit(0)
+    # The resume daemon's opt-out: a "!" in the tmux window name means never auto-compact. Block
+    # Claude Code's own auto compaction there too, without forking or arming /resume.
+    if _window_opted_out():
+        print(json.dumps({"decision": "block",
+                          "reason": "precompact: '!' in the tmux window name opts this session out of auto-compaction"}))
+        sys.exit(0)
 
 
 # ---- 4. Read transcript --------------------------------------------------

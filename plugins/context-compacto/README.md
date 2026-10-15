@@ -4,7 +4,7 @@ Replaces Claude Code's native `/compact` with a token-budget head/middle/tail co
 
 ## What it does
 
-1. The `PreCompact` hook intercepts auto and manual compactions.
+1. The `PreCompact` hook intercepts auto and manual compactions of the main session. A subagent's compaction is left to Claude Code's native compaction, because the hook is only handed the parent's transcript. Claude Code 2.1.300 doesn't mark a subagent's compaction (no `agent_id`), so the hook treats an auto trigger as a subagent's when the parent's context is under 85% of `CLAUDE_CODE_AUTO_COMPACT_WINDOW` and at least 60k tokens short of it (the parent's own auto compaction fires about 25–33k short of the window). Set that variable (for example `"env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "800000"}` in `~/.claude/settings.json`); without it, subagent compactions are blocked and a long subagent runs into the context limit. A tmux window whose name contains `!` is never auto-compacted: the hook refuses the auto compaction without forking or arming `/resume` (the same opt-out the resume daemon honours); a manual `/compact` there still works.
 2. It reads the live transcript JSONL, splits it into `head_tokens` first + `tail_tokens` last, and ships the middle to a summarizer. The model is chosen by the middle's size: `model_200k` (default `sonnet`) when it fits a standard window, otherwise `model_1m` (default `opus[1m]`); if the 200k call errors it escalates to the 1M model.
 3. The summarizer outputs a fixed-shape markdown block:
    - `## Narrative`
