@@ -55,7 +55,7 @@ def hook(script, payload):
 
 def stop(prompt, event="Stop", active=False):
     hook("handoff.py", {"hook_event_name": event, "session_id": session, "prompt_id": prompt,
-                        "stop_hook_active": active, "background_tasks": []})
+                        "transcript_path": args.transcript, "stop_hook_active": active, "background_tasks": []})
 
 
 def busy_for(secs):

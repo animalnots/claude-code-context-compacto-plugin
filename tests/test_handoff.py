@@ -16,11 +16,13 @@ def expansion(command="compact-handoff", session=S1, prompt=P1):
             "prompt": "/" + command}
 
 
-def stop(session=S1, prompt=P1, event="Stop"):
+def stop(session=S1, prompt=P1, event="Stop", transcript=None):
     p = {"hook_event_name": event, "session_id": session, "stop_hook_active": False,
          "last_assistant_message": "It is safe to compact.", "background_tasks": []}
     if prompt is not None:
         p["prompt_id"] = prompt
+    if transcript is not None:
+        p["transcript_path"] = str(transcript)
     return p
 
 
@@ -112,10 +114,18 @@ def test_a_finished_handoff_ignores_later_stops(env):
     assert read_fields(env)[0] == "done"
 
 
-def test_stop_stamps_the_pane_as_hooked(env):
-    run_hook("handoff.py", stop(), env)
+def test_stop_stamps_the_pane_as_hooked(env, tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("{}\n")
+    run_hook("handoff.py", stop(transcript=transcript), env)
     stamp = pathlib.Path(env["COMPACTO_SIGNAL_DIR"]) / "7.hooked"
     assert stamp.read_text().strip() == S1
+
+
+@pytest.mark.parametrize("transcript", ["missing.jsonl", None])
+def test_a_stop_without_a_transcript_on_disk_leaves_the_pane_unstamped(env, tmp_path, transcript):
+    run_hook("handoff.py", stop(transcript=transcript and tmp_path / transcript), env)
+    assert not list(pathlib.Path(env["COMPACTO_SIGNAL_DIR"]).glob("*.hooked"))
 
 
 def test_outside_tmux_state_is_keyed_by_session_and_dropped_when_finished(env):

@@ -150,7 +150,8 @@ def test_after_a_handoff_that_never_started_only_a_newer_stop_allows_a_retry(rig
     time.sleep(7)
     assert rig.typed() == ["/compact-handoff"]
     assert "never started" in rig.daemon_log()
-    run_hook("handoff.py", {"hook_event_name": "Stop", "session_id": str(uuid.uuid4()), "prompt_id": str(uuid.uuid4())},
+    run_hook("handoff.py", {"hook_event_name": "Stop", "session_id": str(uuid.uuid4()), "prompt_id": str(uuid.uuid4()),
+                            "transcript_path": str(rig.transcript)},
              dict(rig.env, TMUX_PANE=rig.target))
     rig.wait_for("COMPACTED", timeout=30)
     assert rig.typed()[:3] == ["/compact-handoff", "/compact-handoff", "/compact"]
