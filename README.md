@@ -82,7 +82,7 @@ Go further and let a long task run *itself* across compactions: **auto-compact a
 /cc:continue continue      # after each auto-compaction resumes, send "continue"
 ```
 
-**⚠ Unbounded and hands-off** — compact → resume → continue → repeat, spending tokens with no human and no cap until you stop the daemon (`Ctrl-C`) or run `/cc:autocompact off`. It also needs a small export added to your statusline so the daemon can read the live context size. Setup, safeguards, and idle-detection tuning are in the [plugin README](plugins/context-compacto/README.md#autonomous-loop-auto-compact--continue--advanced-unattended); on Windows, see [Windows (psmux)](plugins/context-compacto/README.md#windows-psmux).
+**⚠ Unbounded and hands-off** — compact → resume → continue → repeat, spending tokens with no human and no cap until you stop the daemon (`Ctrl-C`) or run `/cc:autocompact off`. It also needs a small export added to your statusline so the daemon can read the live context size. A `!` in a tmux window's name exempts that window; a `=` makes it run `/compact-handoff` at twice the threshold and compact only after that handoff has finished. Setup, safeguards, and idle-detection tuning are in the [plugin README](plugins/context-compacto/README.md#autonomous-loop-auto-compact--continue--advanced-unattended); on Windows, see [Windows (psmux)](plugins/context-compacto/README.md#windows-psmux).
 
 ## Requirements
 
@@ -115,13 +115,15 @@ Then re-run `/plugin install` if there are version changes.
 │   └── context-compacto/               the plugin itself
 │       ├── .claude-plugin/plugin.json  manifest
 │       ├── hooks/
-│       │   ├── hooks.json              PreCompact registration
+│       │   ├── hooks.json              hook registration
 │       │   ├── precompact.py           hook entry point
+│       │   ├── handoff.py              tracks /compact-handoff runs for the "=" marker and the compaction guard
 │       │   ├── pcconf.py               config helper for slash commands
 │       │   ├── rewrite_transcript.py   JSONL fork writer
 │       │   └── compacto-resume-daemon.sh  optional tmux auto-resume watcher
 │       ├── commands/                   /cc:begin /cc:end /cc:both /cc:begin-pct /cc:end-pct /cc:both-pct /cc:model /cc:autoresume /cc:autocompact /cc:continue /cc:show /cc:reset /cc:help
 │       └── README.md                   plugin docs (full usage + config)
+├── tests/                              pytest suite; not part of the installed plugin
 └── README.md                           this file
 ```
 
@@ -136,3 +138,5 @@ git clone https://github.com/animalnots/claude-code-context-compacto-plugin
 ```
 
 Edit files in `plugins/context-compacto/`, then `/plugin marketplace update` to refresh.
+
+Run the tests with `python -m pytest tests` (needs pytest and tmux; each daemon test drives the real daemon against a stand-in Claude on its own tmux server).

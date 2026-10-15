@@ -41,6 +41,10 @@ Autonomous loop (UNATTENDED, no cap): /cc:autocompact N + /cc:continue MSG make 
   (Ctrl-C). Metric is msgs (the statusline number) unless you pass ctx. Needs the statusline export.
   A ! anywhere in a tmux window's name exempts that window from auto-compact (re-read every poll;
   a /compact you type there is still auto-resumed).
+  A = instead (no !) hands off first: at min(600000, 2 x N) the daemon types /compact-handoff
+  (handoff_command=NAME in the config file), waits for that turn to finish, then types /compact.
+  While a /compact-handoff you typed is unfinished, /compact is refused once (repeat it within 2
+  minutes to compact anyway).
 
 Window markers (daemon running, inside tmux): the window option @cc_state is ? when a dialog waits
   for you, $ when Claude finished while you weren't viewing that window, & when it's idle but

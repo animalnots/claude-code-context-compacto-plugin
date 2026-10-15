@@ -17,6 +17,11 @@
 #      A "!" anywhere in the tmux window name opts that window out; it's re-read
 #      every poll, so renaming the window back re-enables auto-compact. Resume (#1)
 #      still runs there, so a /compact you type yourself still gets its /resume.
+#      A "=" instead (and no "!") makes the window hand off first: at min(600000, 2 x the
+#      threshold) this types /compact-handoff (handoff_command=<name>), waits until
+#      hooks/handoff.py records that the handoff's own turn ended with Stop, and only then
+#      types /compact. A handoff that never starts, is cut short or fails is retried on the
+#      /compact back-off below, and never followed by a /compact.
 #
 #   3. POST-RESUME CONTINUE (resume_continue=<message>): after an auto-triggered
 #      compaction resumes, types <message> (e.g. "continue") so the task keeps
@@ -45,6 +50,8 @@
 #   COMPACTO_RESUME_GIVEUP    secs to keep retrying /resume before giving up (default 180)
 #   COMPACTO_MAX_COMPACT_FAILS  genuine /compact failures before a pane is treated as wedged (default 3)
 #   COMPACTO_WEDGE_BACKOFF    retry interval (secs) once a pane is wedged (default 1800)
+#   COMPACTO_HANDOFF_MAX      cap on a "=" window's threshold (default 600000)
+#   COMPACTO_HANDOFF_START_TIMEOUT  secs a typed handoff may take to start before it counts as failed (default 60)
 #
 # Assumes a single tmux server; pane ids are unique per server. psmux (Windows) runs a server per
 # session instead, so there panes are addressed through their session (see pane_target).
@@ -86,6 +93,11 @@ RESUME_GIVEUP="${COMPACTO_RESUME_GIVEUP:-180}"
 # the pane can be cleared by hand. The counter resets the moment the pane compacts normally.
 MAX_FAILS="${COMPACTO_MAX_COMPACT_FAILS:-3}"
 WEDGE_BACKOFF="${COMPACTO_WEDGE_BACKOFF:-1800}"
+HANDOFF_MAX="${COMPACTO_HANDOFF_MAX:-600000}"
+HANDOFF_START_TIMEOUT="${COMPACTO_HANDOFF_START_TIMEOUT:-60}"
+# A handoff you typed yourself in a "=" window counts if it finished this recently, so the
+# daemon types /compact instead of a second handoff.
+HANDOFF_ADOPT=120
 DEBUG="${COMPACTO_DEBUG:-}"                      # set to 1 to log pane state at each auto-compact fire
 CONF="$HOME/.claude/precompact.conf"
 
@@ -208,7 +220,41 @@ pane_pending_compact() {
     # delays a retry (wedge alert still fires), never stacks a second compact.
     $TMUX_CMD capture-pane -p -t "$1" 2>/dev/null | grep -qE '^\s*❯?\s*/compact\s*$'
 }
-pane_autocompact_optout() { [[ "$($TMUX_CMD display-message -p -t "$1" '#{window_name}' 2>/dev/null)" == *'!'* ]]; }
+# The text in the pane's input box (its "❯" line plus wrapped lines), or status 1 when no box is
+# on screen. Same box test as classify. Read as bytes in the C locale: the box starts with "❯"
+# and a no-break space, and awks disagree on Unicode outside it.
+IFS= read -r -d '' BOX_AWK <<'AWK'
+BEGIN { nbsp = sprintf("%c%c", 194, 160) }
+{ line[++n] = $0 }
+END {
+    for (i = 2; i <= n; i++) if (line[i] ~ /^❯/) box = (line[i - 1] ~ /^───/ && line[i] !~ /^❯ [0-9]+\. /) ? i : 0
+    if (!box) exit 1
+    text = substr(line[box], 4)
+    if (index(text, nbsp) == 1) text = substr(text, 3)
+    for (i = box + 1; i <= n && line[i] !~ /^───/; i++) text = text "\n" line[i]
+    sub(/[ \n]+$/, "", text)
+    printf "%s", text
+}
+AWK
+pane_box_text()  { $TMUX_CMD capture-pane -p -t "$1" 2>/dev/null | LC_ALL=C awk "$BOX_AWK"; }
+pane_box_empty() { local t; t="$(pane_box_text "$1")" && [ -z "$t" ]; }
+# Types $2 into pane $1 without Enter; status 0 once the box holds exactly that. Enter is left to
+# the caller, so keys that landed in someone's draft are never submitted, and the autocomplete menu
+# has settled on the typed command. On a mismatch the typed text is erased if it ends the box.
+type_text() {
+    local text i; local -a erase=()
+    $TMUX_CMD send-keys -t "$1" "$2"
+    sleep 1
+    text="$(pane_box_text "$1")" || return 1
+    [ "$text" = "$2" ] && return 0
+    if [[ "$text" == *"$2" ]]; then
+        for ((i = 0; i < ${#2}; i++)); do erase+=(BSpace); done
+        $TMUX_CMD send-keys -t "$1" "${erase[@]}"
+    fi
+    return 1
+}
+# "=" hands a window off before compacting; "!" opts it out altogether and wins.
+handoff_window() { [[ "$1" == *'='* && "$1" != *'!'* ]]; }
 # Durable event ledger. tmux scrollback truncates within hours under DEBUG (which is how
 # two investigations lost the fire history), so every consequential action also appends
 # here. Reconcile against the executions ledger compactions.log written by precompact.py:
@@ -216,17 +262,18 @@ pane_autocompact_optout() { [[ "$($TMUX_CMD display-message -p -t "$1" '#{window
 evlog() { echo "$(date '+%F %T') $*" >> "$SIGNAL_DIR/events.log" 2>/dev/null || true; }
 # GNU stat first: its -f means "file system" and prints a status block before failing on "%m",
 # and that block would land in $m.
-file_age()   { local f="$1" m; m=$(stat -c %Y "$f" 2>/dev/null) || m=$(stat -f %m "$f" 2>/dev/null) || m=0; echo $(( $(date +%s) - m )); }
+file_mtime() { local m; m=$(stat -c %Y "$1" 2>/dev/null) || m=$(stat -f %m "$1" 2>/dev/null) || m=0; echo "$m"; }
+file_age()   { echo $(( $(date +%s) - $(file_mtime "$1") )); }
 
 # Behavior 4 keeps per-pane memory indexed by pane number (%12 -> 12). It starts empty, so
 # after a daemon restart, panes that are already idle count as seen.
-PANE_STATE=(); PANE_UNSEEN=(); PANE_READ_AT=(); PANE_CONTINUED=(); PANE_QUIET=()
-# The daemon's own /compact -> /resume cycle is housekeeping, not a finished turn, until it
-# types a continue that sets Claude working again.
+PANE_STATE=(); PANE_UNSEEN=(); PANE_READ_AT=(); PANE_CONTINUED=(); PANE_QUIET=(); HANDOFF_UNHOOKED=(); HANDOFF_STALE=()
+# The daemon's own handoff -> /compact -> /resume cycle is housekeeping, not a finished turn,
+# until it types a continue that sets Claude working again.
 compaction_in_flight() {
     local k="${1//[^a-zA-Z0-9]/}"
     [ "${PANE_CONTINUED[${1#%}]:-0}" = 1 ] && return 1
-    [ -e "$SIGNAL_DIR/$k.compacting" ] || [ -e "$SIGNAL_DIR/$k.resume" ] || [ -e "$SIGNAL_DIR/$k.resume.busy" ] || [ -e "$SIGNAL_DIR/$k.resumewant" ]
+    [ -e "$SIGNAL_DIR/$k.compacting" ] || [ -e "$SIGNAL_DIR/$k.resume" ] || [ -e "$SIGNAL_DIR/$k.resume.busy" ] || [ -e "$SIGNAL_DIR/$k.resumewant" ] || [ -e "$SIGNAL_DIR/$k.handoffsent" ]
 }
 update_markers() {
     local panes now pane win inmode wactive attached activity shown cmd n w st prev r m wins="" claude="" batch=0
@@ -309,6 +356,98 @@ markers_wanted() {
     [ "$MARKERS_WANTED" = 1 ]
 }
 
+# Behavior 2 for a "=" pane at or over its threshold, called with the poll loop's pane variables
+# set. hooks/handoff.py writes $key.handoff ("state session prompt started ended") and, at every
+# Stop, $key.hooked; $hs marks a handoff this daemon typed.
+handoff_step() {
+    local st="" sess="" prompt="" started="" ended="" hooked="$SIGNAL_DIR/$key.hooked" n="${cpane#%}"
+    if [ ! -e "$hooked" ]; then
+        if [ -z "${HANDOFF_UNHOOKED[$n]:-}" ]; then
+            HANDOFF_UNHOOKED[$n]=1
+            echo "compacto-resume-daemon: pane $ctgt has '=' but no turn there has ended under the handoff hooks yet; it won't be compacted until one does (a Claude started before the hooks were installed needs a restart)" >&2
+            evlog "handoff-unhooked $ctgt"
+        fi
+        return 0
+    fi
+    # After a handoff that never started, wait until a Stop shows this pane's Claude runs the hooks.
+    if [ -n "${HANDOFF_STALE[$n]:-}" ]; then
+        [ "$(file_mtime "$hooked")" -gt "${HANDOFF_STALE[$n]}" ] || return 0
+        unset "HANDOFF_STALE[$n]"
+    fi
+    [ -e "$SIGNAL_DIR/$key.handoff" ] && IFS=$'\t' read -r st sess prompt started ended < "$SIGNAL_DIR/$key.handoff"
+    is_num "${started:-}" || st=""
+    if [ -e "$hs" ]; then
+        if [ -z "$st" ] || [ "$started" -lt "$(file_mtime "$hs")" ]; then
+            # Typed but not started: the keys were lost, the command is unknown, or this Claude
+            # predates the hooks and ran it untracked. Its echo stays on screen either way, so only
+            # idleness tells. One that was merely queued is adopted below once it finishes.
+            if [ "$(file_age "$hs")" -ge "$HANDOFF_START_TIMEOUT" ] && pane_idle "$ctgt"; then
+                HANDOFF_STALE[$n]="$(file_mtime "$hooked")"
+                handoff_failed "never started (Claude there predates the handoff hooks, or handoff_command names no command)"
+            fi
+            return 0
+        fi
+        case "$st" in
+            running) ;;
+            done) compact_after_handoff "$prompt" ;;
+            aborted) handoff_failed "was cut short" ;;
+            *) handoff_failed "ended in an API error" ;;
+        esac
+        return 0
+    fi
+    if [ "$st" = done ] && is_num "${ended:-}" && [ $(( $(date +%s) - ended )) -le "$HANDOFF_ADOPT" ]; then
+        compact_after_handoff "$prompt"
+        return 0
+    fi
+    start_handoff
+}
+start_handoff() {
+    local n gate
+    n="$(cat "$fc" 2>/dev/null)"; is_num "$n" || n=0
+    gate="$MIN_INTERVAL"; [ "$n" -gt 0 ] && gate="$COOLDOWN"; [ "$n" -ge "$MAX_FAILS" ] && gate="$WEDGE_BACKOFF"
+    if [ -e "$la" ] && [ "$(file_age "$la")" -lt "$gate" ]; then return 0; fi
+    pane_idle "$ctgt" && pane_box_empty "$ctgt" && ! pane_pending_compact "$ctgt" || return 0
+    if ! type_text "$ctgt" "/$HANDOFF_CMD"; then
+        : > "$la"; evlog "handoff-not-typed $ctgt (input box changed while typing)"; return 0
+    fi
+    # Stamped before Enter: the handoff counts as ours only if it started at or after this mtime.
+    : > "$hs"; : > "$la"; unset "PANE_CONTINUED[${cpane#%}]"
+    $TMUX_CMD send-keys -t "$ctgt" Enter
+    evlog "handoff-sent $ctgt $METRIC=$val"
+    echo "compacto-resume-daemon: handoff $ctgt /$HANDOFF_CMD ($METRIC=$val >= $HTHRESH)"
+}
+# $1 = the finished handoff's prompt_id, re-checked after the settle.
+compact_after_handoff() {
+    local st="" prompt=""
+    pane_idle "$ctgt" && pane_box_empty "$ctgt" && ! pane_pending_compact "$ctgt" || return 0
+    # A Stop hook that blocks keeps the handoff's turn going after handoff.py marked it done, so
+    # the pane must still be at rest a moment later.
+    sleep "$SETTLE"
+    pane_idle "$ctgt" && pane_box_empty "$ctgt" || return 0
+    [ -e "$SIGNAL_DIR/$key.handoff" ] && IFS=$'\t' read -r st _ prompt _ < "$SIGNAL_DIR/$key.handoff"
+    [ "$st" = done ] && [ "$prompt" = "$1" ] || return 0
+    type_text "$ctgt" "/compact" || { evlog "handoff-compact-not-typed $ctgt (input box changed while typing)"; return 0; }
+    rm -f "$hs"; : > "$cm"; : > "$la"; unset "PANE_CONTINUED[${cpane#%}]"
+    $TMUX_CMD send-keys -t "$ctgt" Enter
+    evlog "handoff-compact $ctgt $METRIC=$val"
+    [ -n "$CONTINUE_MSG" ] && : > "$SIGNAL_DIR/$key.await-continue"
+    rm -f "$cf"    # consume this reading; .compacting debounces until the fork resumes
+    echo "compacto-resume-daemon: auto-compact $ctgt after its handoff ($METRIC=$val >= $HTHRESH)"
+}
+# A handoff that won't be followed by /compact. Counts toward the same wedge back-off as /compact.
+handoff_failed() {
+    local n
+    rm -f "$hs"; : > "$la"
+    n="$(cat "$fc" 2>/dev/null)"; is_num "$n" || n=0; n=$((n + 1)); echo "$n" > "$fc"
+    evlog "handoff-failed $ctgt /$HANDOFF_CMD $1 (fail #$n)"
+    if [ "$n" -eq "$MAX_FAILS" ]; then
+        echo "compacto-resume-daemon: pane $ctgt WEDGED — /$HANDOFF_CMD failed ${n}× (last: $1); backing off to ${WEDGE_BACKOFF}s." >&2
+        evlog "WEDGED $ctgt fails=$n backoff=${WEDGE_BACKOFF}s"
+    else
+        echo "compacto-resume-daemon: /$HANDOFF_CMD in $ctgt $1; next try in ${COOLDOWN}s" >&2
+    fi
+}
+
 echo "compacto-resume-daemon: watching $SIGNAL_DIR (poll ${POLL}s, tmux='$TMUX_CMD'). Ctrl-C to stop."
 clear_markers                                       # left behind by a daemon that was SIGKILLed
 
@@ -316,9 +455,14 @@ while true; do
     THRESH="$(conf_get auto_compact_at)"; [ -n "$THRESH" ] || THRESH=300000   # pcconf.py's AUTO_COMPACT_DEFAULT; off is a stored 0
     METRIC="$(conf_get auto_compact_metric)"; [ -n "$METRIC" ] || METRIC="msgs"
     CONTINUE_MSG="$(conf_get resume_continue)"
+    # handoff.py reads the same key; both drop one leading slash.
+    HANDOFF_CMD="$(conf_get handoff_command)"; HANDOFF_CMD="${HANDOFF_CMD//[[:space:]]/}"; HANDOFF_CMD="${HANDOFF_CMD#/}"
+    [ -n "$HANDOFF_CMD" ] || HANDOFF_CMD="compact-handoff"
 
     # ---- behavior 2: threshold auto-compact -------------------------------
     if is_num "$THRESH" && [ "$THRESH" -gt 0 ]; then
+        HTHRESH=$(( THRESH * 2 )); [ "$HTHRESH" -gt "$HANDOFF_MAX" ] && HTHRESH="$HANDOFF_MAX"
+        LO_THRESH=$(( THRESH < HTHRESH ? THRESH : HTHRESH ))
         for cf in "$SIGNAL_DIR"/*.ctx; do
             [ -e "$cf" ] || continue
             # 4th field: the psmux server pid (see pane_target). Windows writers may end lines with CRLF.
@@ -330,7 +474,8 @@ while true; do
             key="${cserver:+${cserver}_}${cpane//[^a-zA-Z0-9]/}"
             ctgt="$(pane_target "${cpane}" "$cserver")"; rc=$?
             if [ "$rc" = 1 ]; then                  # session closed -> clean up its files
-                rm -f "$cf" "$SIGNAL_DIR/$key.compacting" "$SIGNAL_DIR/$key.await-continue" "$SIGNAL_DIR/$key.lastauto" "$SIGNAL_DIR/$key.belowsince" "$SIGNAL_DIR/$key.resumewant" "$SIGNAL_DIR/$key.failcount"
+                rm -f "$cf" "$SIGNAL_DIR/$key.compacting" "$SIGNAL_DIR/$key.await-continue" "$SIGNAL_DIR/$key.lastauto" "$SIGNAL_DIR/$key.belowsince" "$SIGNAL_DIR/$key.resumewant" "$SIGNAL_DIR/$key.failcount" \
+                      "$SIGNAL_DIR/$key.handoffsent" "$SIGNAL_DIR/$key.handoff" "$SIGNAL_DIR/$key.hooked" "$SIGNAL_DIR/$key.guard"
                 continue
             fi
             [ "$rc" = 0 ] || continue               # same %N in several psmux sessions, no server pid to pick one
@@ -347,6 +492,16 @@ while true; do
 
             cm="$SIGNAL_DIR/$key.compacting"        # debounce: one compaction in flight per pane
             bs="$SIGNAL_DIR/$key.belowsince"
+            hs="$SIGNAL_DIR/$key.handoffsent"
+            # The window name sets the threshold, so read it once the pane could be over either one.
+            wname=""; handoff=0; pthresh="$THRESH"
+            if [ "$val" -ge "$LO_THRESH" ]; then
+                wname="$($TMUX_CMD display-message -p -t "$ctgt" '#{window_name}' 2>/dev/null)"
+                handoff_window "$wname" && { handoff=1; pthresh="$HTHRESH"; }
+            fi
+            # A typed handoff is dropped once its window loses the "=" or its size falls (compacted
+            # some other way), so a later crossing starts a fresh one.
+            if [ -e "$hs" ] && ! { [ "$handoff" = 1 ] && [ "$val" -ge "$pthresh" ]; }; then rm -f "$hs"; fi
             # Re-arm .compacting only after the pane has been CONFIRMED below the threshold
             # for REARM_GRACE seconds — i.e. a fork really loaded and the size really dropped.
             # Clearing it sooner is exactly what re-fired the second /compact:
@@ -357,7 +512,7 @@ while true; do
             #     .ctx flicker.
             # Sustained-below defeats both: a failed resume keeps size high so .compacting
             # holds (until COOLDOWN), and a 1-2s flicker never reaches the grace window.
-            if [ "$val" -lt "$THRESH" ]; then
+            if [ "$val" -lt "$pthresh" ]; then
                 if [ -e "$cm" ]; then               # only meaningful while a compaction is pending
                     [ -e "$bs" ] || : > "$bs"
                     # Confirmed recovered: the fork loaded and the size really dropped. Clear
@@ -368,7 +523,8 @@ while true; do
             fi
             rm -f "$bs"                              # back above threshold: reset the sustained-below timer
             la="$SIGNAL_DIR/$key.lastauto"          # hard floor between compacts on this pane
-            if [ -e "$la" ] && [ "$(file_age "$la")" -lt "$MIN_INTERVAL" ]; then
+            # A "=" pane applies it in start_handoff instead: its /compact follows the handoff it typed.
+            if [ "$handoff" = 0 ] && [ -e "$la" ] && [ "$(file_age "$la")" -lt "$MIN_INTERVAL" ]; then
                 continue
             fi
             fc="$SIGNAL_DIR/$key.failcount"
@@ -404,8 +560,12 @@ while true; do
                     continue
                 fi
             fi
-            if pane_autocompact_optout "$ctgt"; then
+            if [[ "$wname" == *'!'* ]]; then
                 [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: skip $ctgt val=$val — '!' in window name (auto-compact opt-out)" >&2
+                continue
+            fi
+            if [ "$handoff" = 1 ]; then
+                handoff_step
                 continue
             fi
             if ! pane_idle "$ctgt"; then           # never interrupt an in-progress turn

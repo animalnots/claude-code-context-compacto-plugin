@@ -4,7 +4,7 @@ Replaces Claude Code's native `/compact` with a token-budget head/middle/tail co
 
 ## What it does
 
-1. The `PreCompact` hook intercepts auto and manual compactions of the main session. A subagent's compaction is left to Claude Code's native compaction, because the hook is only handed the parent's transcript. Claude Code 2.1.300 doesn't mark a subagent's compaction (no `agent_id`), so the hook treats an auto trigger as a subagent's when the parent's context is under 85% of `CLAUDE_CODE_AUTO_COMPACT_WINDOW` and at least 60k tokens short of it (the parent's own auto compaction fires about 25–33k short of the window). Set that variable (for example `"env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "800000"}` in `~/.claude/settings.json`); without it, subagent compactions are blocked and a long subagent runs into the context limit. A tmux window whose name contains `!` is never auto-compacted: the hook refuses the auto compaction without forking or arming `/resume` (the same opt-out the resume daemon honours); a manual `/compact` there still works.
+1. The `PreCompact` hook intercepts auto and manual compactions of the main session. A subagent's compaction is left to Claude Code's native compaction, because the hook is only handed the parent's transcript. Claude Code 2.1.300 doesn't mark a subagent's compaction (no `agent_id`), so the hook treats an auto trigger as a subagent's when the parent's context is under 85% of `CLAUDE_CODE_AUTO_COMPACT_WINDOW` and at least 60k tokens short of it (the parent's own auto compaction fires about 25–33k short of the window). Set that variable (for example `"env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "800000"}` in `~/.claude/settings.json`); without it, subagent compactions are blocked and a long subagent runs into the context limit. A tmux window whose name contains `!` is never auto-compacted: the hook refuses the auto compaction without forking or arming `/resume` (the same opt-out the resume daemon honours); a manual `/compact` there still works. While a `/compact-handoff` you typed hasn't finished (it's still running, or its turn was interrupted), every compaction is refused, so a `/compact` queued behind it can't compact away what it was saving; type `/compact` again within 2 minutes to compact anyway. Windows named with `=` have their own rules, see [Hand off first with `=`](#autonomous-loop-auto-compact--continue--advanced-unattended).
 2. It reads the live transcript JSONL, splits it into `head_tokens` first + `tail_tokens` last, and ships the middle to a summarizer. The model is chosen by the middle's size: `model_200k` (default `sonnet`) when it fits a standard window, otherwise `model_1m` (default `opus[1m]`); if the 200k call errors it escalates to the 1M model.
 3. The summarizer outputs a fixed-shape markdown block:
    - `## Narrative`
@@ -202,6 +202,14 @@ Run the **same daemon** as auto-resume — it does all three jobs.
 
 **Opt a window out with `!`.** Put `!` anywhere in a tmux window's name (`prefix ,` or `tmux rename-window 'review!'`) and the daemon never auto-`/compact`s a pane in that window. The name is re-read every poll, so renaming the window back re-enables auto-compact within a second. Auto-resume is untouched: a `/compact` you type there yourself still compacts through the plugin, and the daemon still types its `/resume`.
 
+**Hand off first with `=`.** Put `=` in a window's name instead (`!` wins if both are there) and the daemon saves your work before compacting. Once a pane there reaches `min(600000, 2 × auto_compact_at)`, that is 530000 at `auto_compact_at=265000`, the daemon:
+
+1. types `/compact-handoff` into the empty input box of an idle pane;
+2. waits until the plugin's hooks see that handoff's own turn end normally (`Stop` with the same prompt id);
+3. types `/compact` once the pane is idle again, and the usual `/resume` follows.
+
+`/compact-handoff` is a skill or command you provide; name another one with `handoff_command=<name>` in `~/.claude/precompact.conf`. The daemon presses Enter only after the box shows exactly what it typed, so it never submits a draft of yours. A handoff that is interrupted, ends in an API error, or never starts is never followed by `/compact`. It is retried on the same back-off as a failed `/compact`, and after one that never started the daemon waits until Claude there finishes another turn. In a `=` window the hook refuses Claude Code's own auto compaction, and refuses a `/compact` typed before this session's handoff has finished (type it again within 2 minutes to compact anyway). The hooks load when a Claude session starts, so a session started before this version is left alone: the daemon says so in its log.
+
 **Window markers: `?`, `$`, `&`.** The daemon also labels every tmux window running Claude by setting the window option `@cc_state`:
 
 - `?` a question, permission or trust dialog is waiting for you;
@@ -235,9 +243,11 @@ COMPACTO_CLAUDE_CMD_REGEX='^([0-9]+\.[0-9]+\.[0-9]+|claude|node)$'   # process n
 COMPACTO_COMPACT_COOLDOWN=300            # secs before a stuck in-flight compaction is retried (> the 240s summarizer timeout)
 COMPACTO_CONTINUE_SETTLE=3               # secs to let a resume render before typing the continue message
 COMPACTO_POLL_SECS=1                     # poll interval
+COMPACTO_HANDOFF_MAX=600000              # cap on a "=" window's threshold
+COMPACTO_HANDOFF_START_TIMEOUT=60        # secs a typed handoff may take to start before it counts as failed
 ```
 
-Config keys (in `~/.claude/precompact.conf`, read live on every poll): `auto_compact_at`, `auto_compact_metric` (`msgs` | `ctx`), `resume_continue`.
+Config keys (in `~/.claude/precompact.conf`, read live on every poll): `auto_compact_at`, `auto_compact_metric` (`msgs` | `ctx`), `resume_continue`, `handoff_command` (default `compact-handoff`).
 
 ## Windows (psmux)
 

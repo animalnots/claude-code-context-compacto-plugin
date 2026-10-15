@@ -14,6 +14,9 @@ CLAUDE_CODE_AUTO_COMPACT_WINDOW and at least 60k tokens short of it (without tha
 variable they are still blocked). An auto compaction in a tmux window whose name
 contains "!" is refused outright, with no fork and no /resume.
 
+A compaction is also refused while this session's /compact-handoff is unfinished, and in a
+tmux window whose name contains "=" unless that handoff finished (see handoff.py).
+
 Usage:
   python precompact.py [model]
 
@@ -66,6 +69,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -152,6 +156,9 @@ out_dir = pathlib.Path(cwd_dir) / ".claude" / "summaries"
 out_dir.mkdir(parents=True, exist_ok=True)
 
 claude_bin = shutil.which("claude") or ""
+# The summarizer is a headless Claude that runs this plugin's hooks too. Outside the pane's tmux,
+# its Stop can't pass for this pane's session in handoff.py's .hooked stamp.
+summarizer_env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
 
 hooks_dir = str(pathlib.Path(__file__).resolve().parent)
 sys.path.insert(0, hooks_dir)
@@ -159,6 +166,10 @@ try:
     import rewrite_transcript
 except ImportError:
     rewrite_transcript = None
+try:
+    import handoff
+except ImportError:
+    handoff = None
 
 
 # ---- 3. Parse stdin payload ----------------------------------------------
@@ -219,16 +230,16 @@ def _auto_compact_trigger_tokens():
     return window * pct // 100 if window > 0 else None
 
 
-def _window_opted_out():
-    tmux = shutil.which(os.environ.get("COMPACTO_TMUX") or "tmux")
-    if not (TMUX_PANE and tmux):
-        return False
+def _window_name():
+    # COMPACTO_TMUX may carry arguments ("tmux -L sock"), as the daemon allows.
+    tmux = shlex.split(os.environ.get("COMPACTO_TMUX") or "tmux")
+    if not (TMUX_PANE and tmux and shutil.which(tmux[0])):
+        return ""
     try:
-        name = subprocess.run([tmux, "display-message", "-p", "-t", TMUX_PANE, "#{window_name}"],
-                              capture_output=True, text=True, timeout=5).stdout
+        return subprocess.run(tmux + ["display-message", "-p", "-t", TMUX_PANE, "#{window_name}"],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
-        return False
-    return "!" in name
+        return ""
 
 
 if trigger == "auto":
@@ -238,11 +249,17 @@ if trigger == "auto":
     parent_tokens = _last_context_tokens(transcript_path)
     if trigger_tokens and 0 < parent_tokens < min(trigger_tokens * 0.85, trigger_tokens - 60000):
         sys.exit(0)
-    # The resume daemon's opt-out: a "!" in the tmux window name means never auto-compact. Block
-    # Claude Code's own auto compaction there too, without forking or arming /resume.
-    if _window_opted_out():
-        print(json.dumps({"decision": "block",
-                          "reason": "precompact: '!' in the tmux window name opts this session out of auto-compaction"}))
+window_name = _window_name()
+# The resume daemon's opt-out: a "!" in the tmux window name means never auto-compact. Block
+# Claude Code's own auto compaction there too, without forking or arming /resume.
+if trigger == "auto" and "!" in window_name:
+    print(json.dumps({"decision": "block",
+                      "reason": "precompact: '!' in the tmux window name opts this session out of auto-compaction"}))
+    sys.exit(0)
+if handoff is not None:
+    handoff_block = handoff.check_compaction(session_id, trigger, window_name)
+    if handoff_block:
+        print(json.dumps({"decision": "block", "reason": handoff_block}))
         sys.exit(0)
 
 
@@ -442,7 +459,7 @@ def _summarize(model_id, text):
              "--no-session-persistence", "--output-format", "text",
              "--tools", ""],
             input=_build_user_prompt(text), capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=240
+            encoding="utf-8", errors="replace", timeout=240, env=summarizer_env
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip(), None
