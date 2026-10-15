@@ -22,7 +22,7 @@ def env(tmp_path):
     return e
 
 
-def run_hook(script, payload, env):
+def run_hook(script, payload, env, args=()):
     raw = payload if isinstance(payload, str) else json.dumps(payload)
-    return subprocess.run([sys.executable, str(HOOKS / script)], input=raw,
+    return subprocess.run([sys.executable, str(HOOKS / script), *args], input=raw,
                           capture_output=True, text=True, env=env, timeout=60)

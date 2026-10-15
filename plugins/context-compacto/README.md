@@ -4,7 +4,7 @@ Replaces Claude Code's native `/compact` with a token-budget head/middle/tail co
 
 ## What it does
 
-1. The `PreCompact` hook intercepts auto and manual compactions of the main session. A subagent's compaction is left to Claude Code's native compaction, because the hook is only handed the parent's transcript. Claude Code 2.1.300 doesn't mark a subagent's compaction (no `agent_id`), so the hook treats an auto trigger as a subagent's when the parent's context is under 85% of `CLAUDE_CODE_AUTO_COMPACT_WINDOW` and at least 60k tokens short of it (the parent's own auto compaction fires about 25–33k short of the window). Set that variable (for example `"env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "800000"}` in `~/.claude/settings.json`); without it, subagent compactions are blocked and a long subagent runs into the context limit. A tmux window whose name contains `!` is never auto-compacted: the hook refuses the auto compaction without forking or arming `/resume` (the same opt-out the resume daemon honours); a manual `/compact` there still works. While a `/compact-handoff` you typed hasn't finished (it's still running, or its turn was interrupted), every compaction is refused, so a `/compact` queued behind it can't compact away what it was saving; type `/compact` again within 2 minutes to compact anyway. Windows named with `=` have their own rules, see [Hand off first with `=`](#autonomous-loop-auto-compact--continue--advanced-unattended).
+1. The `PreCompact` hook intercepts auto and manual compactions of the main session. A subagent's compaction is left to Claude Code's native compaction, because the hook is only handed the parent's transcript. Claude Code 2.1.300 doesn't mark a subagent's compaction (no `agent_id`), so the hook treats an auto trigger as a subagent's when the parent's context is under 85% of `CLAUDE_CODE_AUTO_COMPACT_WINDOW` and at least 60k tokens short of it (the parent's own auto compaction fires about 25–33k short of the window). Set that variable with `/cc:bigwindow` (for example `/cc:bigwindow 600k`, which writes it into the `env` block of `~/.claude/settings.json`); without it, subagent compactions are blocked and a long subagent runs into the context limit. A tmux window whose name contains `!` is never auto-compacted: the hook refuses the auto compaction without forking or arming `/resume` (the same opt-out the resume daemon honours); a manual `/compact` there still works. While a `/compact-handoff` you typed hasn't finished (it's still running, or its turn was interrupted), every compaction is refused, so a `/compact` queued behind it can't compact away what it was saving; type `/compact` again within 2 minutes to compact anyway. Windows named with `=` have their own rules, see [Hand off first with `=`](#autonomous-loop-auto-compact--continue--advanced-unattended).
 2. It reads the live transcript JSONL, splits it into `head_tokens` first + `tail_tokens` last, and ships the middle to a summarizer. The model is chosen by the middle's size: `model_200k` (default `sonnet`) when it fits a standard window, otherwise `model_1m` (default `opus[1m]`); if the 200k call errors it escalates to the 1M model.
 3. The summarizer outputs a fixed-shape markdown block:
    - `## Narrative`
@@ -58,6 +58,7 @@ All commands are namespaced under the plugin's prefix `/cc:` (Claude Code does t
 | `/cc:autoresume on\|off` | arm/disarm tmux auto-resume — a daemon types `/resume <fork>` into your pane after each compact (default **off**; see [Auto-resume](#auto-resume-optional-off-by-default)) |
 | `/cc:autocompact N [msgs\|ctx]` | auto-`/compact` this pane once it reaches N tokens (default **300000**, `off` disables; see [Autonomous loop](#autonomous-loop-auto-compact--continue--advanced-unattended)) |
 | `/cc:continue MSG\|off` | after an auto-triggered compaction resumes, auto-send MSG (e.g. `continue`) so the task keeps going (default **off**) |
+| `/cc:bigwindow N\|off` | Claude Code's own auto-compact window, for every session including running ones: sets `CLAUDE_CODE_AUTO_COMPACT_WINDOW` in `~/.claude/settings.json` (N = 100k–1M, e.g. `600k`; with no N it shows the value). It prints the subagent cutoff from step 1 and any pane at or over it. While it's set, Claude Code's own `/autocompact` can't change the window |
 | `/cc:show`        | print current config |
 | `/cc:reset`       | delete config (revert to defaults) |
 | `/cc:help`        | inline help |
@@ -318,11 +319,11 @@ plugins/context-compacto/
 ├── hooks/
 │   ├── hooks.json                  PreCompact registration (auto + manual)
 │   ├── precompact.py               hook entry: writes preview + fork (+ auto-resume signal)
-│   ├── pcconf.py                   /cc:begin /cc:end /cc:both /cc:model /cc:autoresume /cc:autocompact /cc:continue /cc:show /cc:reset config helper
+│   ├── pcconf.py                   /cc:begin /cc:end /cc:both /cc:model /cc:autoresume /cc:autocompact /cc:continue /cc:bigwindow /cc:show /cc:reset config helper
 │   ├── rewrite_transcript.py       JSONL surgery: head + synth + tail with parentUuid relinking
 │   └── compacto-resume-daemon.sh   optional watcher: auto-resume + threshold auto-compact + post-resume continue
 ├── commands/                       slash commands
-│   ├── begin.md end.md both.md begin-pct.md end-pct.md both-pct.md model.md autoresume.md autocompact.md continue.md show.md reset.md help.md
+│   ├── begin.md end.md both.md begin-pct.md end-pct.md both-pct.md model.md autoresume.md autocompact.md continue.md bigwindow.md show.md reset.md help.md
 └── README.md
 ```
 

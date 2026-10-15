@@ -4,7 +4,7 @@
 Invoked by the begin / end / both / begin-pct / end-pct / both-pct / model /
 model200k / model1m / show / reset / help slash-command files (each lives under
 the `cc` plugin, so they're typed as /cc:begin /cc:end etc.). Reads & writes the
-persistent config at ~/.claude/precompact.conf.
+persistent config at ~/.claude/precompact.conf, and for bigwindow ~/.claude/settings.json.
 
 Usage:
   python pcconf.py <cmd> [arg]
@@ -20,15 +20,25 @@ Usage:
     autoresume on|off  arm/disarm the tmux auto-resume signal (default off)
     autocompact N [msgs|ctx]  auto-/compact a pane once it reaches N tokens (default 300000; off stores 0)
     continue MSG|off  message auto-sent after an auto-compacted resume, e.g. continue (default off)
+    bigwindow N|off  Claude Code's auto-compact window, CLAUDE_CODE_AUTO_COMPACT_WINDOW in
+                 ~/.claude/settings.json (N = 100k..1M); no N reports it
     show         print the current config (or defaults note)
     reset        delete the config file
     help         print usage
 
 Percent commands enforce: 0 ≤ N ≤ 100 and head_pct + tail_pct ≤ 100.
 """
+import json
+import math
 import os
 import pathlib
+import re
+import shlex
+import shutil
+import subprocess
 import sys
+
+import handoff
 
 
 # Force UTF-8 on stdout/stderr so Windows consoles (cp1252 default) don't
@@ -46,6 +56,13 @@ CONF = pathlib.Path.home() / ".claude" / "precompact.conf"
 # falls back to the same number on its own; change both together.
 AUTO_COMPACT_DEFAULT = 300000
 
+SETTINGS = pathlib.Path.home() / ".claude" / "settings.json"
+WINDOW_VAR = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+# What Claude Code's /autocompact accepts. Claude Code raises a smaller window to its minimum,
+# which precompact.py's subagent rule wouldn't know.
+WINDOW_MIN, WINDOW_MAX = 100000, 1000000
+WINDOW_USAGE = "usage: /cc:bigwindow N | off   (N = 100k..1M, e.g. 600k)"
+
 
 def _read_lines():
     if not CONF.exists():
@@ -53,13 +70,22 @@ def _read_lines():
     return CONF.read_text(encoding="utf-8").splitlines()
 
 
+def _replace_file(path, text):
+    # Through the real path, so a symlinked settings.json stays a symlink, and with the old mode,
+    # since settings.json can hold API keys in its env.
+    path = pathlib.Path(os.path.realpath(path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    if path.exists():
+        shutil.copymode(path, tmp)
+    os.replace(tmp, path)
+
+
 def _write_lines(lines):
-    CONF.parent.mkdir(parents=True, exist_ok=True)
     # The daemon re-reads this file every second, and a half-written one would read as
     # "no threshold", which means the default rather than off. Write aside, then swap in.
-    tmp = CONF.with_name(CONF.name + ".tmp")
-    tmp.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-    os.replace(tmp, CONF)
+    _replace_file(CONF, "\n".join(lines) + ("\n" if lines else ""))
 
 
 def _set(key, val):
@@ -162,6 +188,146 @@ def _reset():
     print("config cleared (defaults restored)")
 
 
+def _parse_window(arg):
+    """Tokens for 600000, 600k, 1M or a bare 100..1000 (thousands), as /autocompact reads them; None if invalid."""
+    m = re.fullmatch(r"([0-9]{1,9})([km]?)", arg)
+    if not m:
+        return None
+    n = int(m.group(1)) * {"": 1, "k": 1000, "m": 1000000}[m.group(2)]
+    if not m.group(2) and 100 <= n <= 1000:
+        n *= 1000
+    return n if WINDOW_MIN <= n <= WINDOW_MAX else None
+
+
+def _load_settings():
+    """(settings, None), with a missing file read as {}, or (None, why it can't be used)."""
+    try:
+        text = SETTINGS.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}, None
+    except (OSError, UnicodeDecodeError) as e:
+        return None, f"can't be read ({e})"
+    try:
+        data = json.loads(text)
+    except ValueError as e:
+        return None, f"isn't valid JSON ({e})"
+    if not isinstance(data, dict) or not isinstance(data.get("env", {}), dict):
+        return None, "isn't a JSON object with an env object"
+    return data, None
+
+
+def _save_settings(data):
+    """None once written, or why it couldn't be."""
+    try:
+        _replace_file(SETTINGS, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    except OSError as e:
+        return f"can't be written ({e})"
+    return None
+
+
+def _subagent_ceiling(window):
+    # precompact.py's subagent rule on the same inputs; change both together.
+    try:
+        pct = min(max(int(os.environ.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "100")), 1), 100)
+    except ValueError:
+        pct = 100
+    trigger = window * pct // 100
+    return math.ceil(min(trigger * 0.85, trigger - 60000))
+
+
+def _window_names():
+    """{pane id: window name} for the panes tmux knows, or None when it can't be asked."""
+    tmux = shlex.split(os.environ.get("COMPACTO_TMUX") or "tmux")
+    if not (tmux and shutil.which(tmux[0])):
+        return None
+    try:
+        r = subprocess.run(tmux + ["list-panes", "-a", "-F", "#{pane_id}\t#{window_name}"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode:
+        return None
+    return dict(ln.split("\t", 1) for ln in r.stdout.splitlines() if "\t" in ln)
+
+
+def _panes_over(limit):
+    """(pane, window name, context) for each pane whose statusline export is at or over limit."""
+    names = _window_names()
+    over = []
+    for f in sorted(handoff.signal_dir().glob("*.ctx")):
+        try:
+            fields = f.read_text(encoding="utf-8").strip().split("\t")
+            pane, tokens = fields[0], int(fields[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        # A 4th field is a psmux server pid, and those panes aren't in this tmux's list.
+        local = names is not None and len(fields) < 4
+        if local and pane not in names:
+            continue
+        if tokens >= limit:
+            over.append((pane, names[pane] if local else "", tokens))
+    return over
+
+
+def _report_window(value):
+    if not value:
+        print(f"bigwindow is off ({WINDOW_VAR} isn't set in ~/.claude/settings.json)")
+        return
+    try:
+        window = int(value)
+    except ValueError:
+        print(f"bigwindow is {value!r} in ~/.claude/settings.json, which isn't a plain token count, "
+              "so Claude Code and this plugin ignore it")
+        return
+    print(f"bigwindow is {window} ({WINDOW_VAR} in ~/.claude/settings.json; running sessions pick it up too)")
+    print("Claude Code compacts on its own about 25-33k below that.")
+    ceiling = _subagent_ceiling(window)
+    if ceiling <= 0:
+        print("That's too small for the plugin to tell a subagent's compaction from the main session's, "
+              "so it blocks both.")
+        return
+    print(f"A subagent's compaction runs natively while its main session is under {ceiling}.")
+    over = _panes_over(ceiling)
+    if not over:
+        print(f"Panes at or over {ceiling}: none")
+        return
+    print(f"Panes at or over {ceiling}, whose subagents can't compact:")
+    for pane, name, tokens in over:
+        print(f"  {pane}  {name}  {tokens}" if name else f"  {pane}  {tokens}")
+
+
+def _bigwindow(arg):
+    val = (arg or "").strip().lower()
+    window = None
+    if val and val != "off":
+        window = _parse_window(val)
+        if window is None:
+            print(f"/cc:bigwindow: {arg!r} isn't a size from 100k to 1M; nothing changed")
+            print(WINDOW_USAGE)
+            return
+    settings, err = _load_settings()
+    if not err and val:
+        env = settings.get("env", {})
+        want = str(window) if window else None
+        if env.get(WINDOW_VAR) != want:
+            if want:
+                settings.setdefault("env", {})[WINDOW_VAR] = want
+            else:
+                del env[WINDOW_VAR]
+                if not env:
+                    del settings["env"]
+            err = _save_settings(settings)
+    if err:
+        print(f"/cc:bigwindow: ~/.claude/settings.json {err}; nothing changed")
+        return
+    _report_window(settings.get("env", {}).get(WINDOW_VAR))
+    if val == "off":
+        print("Claude Code goes back to /autocompact, autoCompactWindow or the model's default, and the "
+              "plugin can't tell a subagent's compaction from the main session's, so it blocks both.")
+    elif not val:
+        print(WINDOW_USAGE)
+
+
 HELP = """Precompact slash commands (all under the /cc: plugin namespace)
 
 Absolute token budgets (N = raw tiktoken count):
@@ -184,12 +350,13 @@ Other (the middle is summarized by a model picked automatically from its size):
   /cc:autoresume on|off  after each compact, a daemon types /resume <fork> into your tmux pane (default off)
   /cc:autocompact N [msgs|ctx]  auto-/compact this pane at N tokens; needs the daemon + statusline export (default 300000; off disables)
   /cc:continue MSG|off  after an auto-compacted resume, auto-send MSG (e.g. continue) so the task keeps going (default off)
+  /cc:bigwindow N|off  Claude Code's own auto-compact window, every session (e.g. /cc:bigwindow 600k; N = 100k..1M)
   /cc:show           print current config
   /cc:reset          clear config (defaults restored)
   /cc:help           this help
 
-The three automation commands with NO argument report what they're set to and
-  change nothing -- /cc:autoresume, /cc:autocompact, /cc:continue.
+The automation commands with NO argument report what they're set to and change
+  nothing -- /cc:autoresume, /cc:autocompact, /cc:continue, /cc:bigwindow.
 
 Note: [1m] models need the long-context beta / usage credits. On Claude Max,
   opus[1m] works; sonnet[1m] needs usage credits; standard models need neither.
@@ -216,6 +383,12 @@ Window markers (daemon running, inside tmux): the window option @cc_state is
   ? when a dialog waits for you, $ when Claude finished while you weren't viewing
   that window, & when it's idle but background agents/shells still run. Add
   #{@cc_state} to window-status-format to see it (see README).
+
+Big window: /cc:bigwindow N writes CLAUDE_CODE_AUTO_COMPACT_WINDOW into
+  ~/.claude/settings.json, and running sessions pick it up too. A subagent's
+  compaction runs natively while its main session is under min(0.85 x N, N - 60000);
+  with it off, the plugin blocks those as well. While it's set, Claude Code's own
+  /autocompact can't change the window.
 
 Mutex per window (last command wins): /cc:begin clears head_pct; /cc:begin-pct clears head_tokens.
   Mixing modes ACROSS windows is fine (e.g. head_tokens=20000 + tail_pct=15).
@@ -350,6 +523,9 @@ def main():
             _clear("resume_continue")
         else:
             _set("resume_continue", msg)
+    elif cmd == "bigwindow":
+        _bigwindow(arg)
+        return
     elif cmd == "show":
         _show()
         return
@@ -360,7 +536,7 @@ def main():
         sys.stdout.write(HELP)
         return
     else:
-        sys.stderr.write("usage: pcconf.py begin|end|both|begin-pct|end-pct|both-pct N | model|model200k|model1m MODEL | autoresume on|off | autocompact N [msgs|ctx] | continue MSG|off | show | reset | help\n")
+        sys.stderr.write("usage: pcconf.py begin|end|both|begin-pct|end-pct|both-pct N | model|model200k|model1m MODEL | autoresume on|off | autocompact N [msgs|ctx] | continue MSG|off | bigwindow N|off | show | reset | help\n")
         sys.exit(1)
 
     # mutating commands fall through and print the resulting config

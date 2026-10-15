@@ -1,5 +1,5 @@
 ---
-description: Show precompact slash commands (begin, begin-pct, end, end-pct, both, both-pct, model, autoresume, autocompact, continue, show, reset).
+description: Show precompact slash commands (begin, begin-pct, end, end-pct, both, both-pct, model, autoresume, autocompact, continue, bigwindow, show, reset).
 ---
 
 Print ONLY the block below verbatim — no preamble, no commentary, no surrounding markdown, no trailing remarks. Do NOT describe what it is. Just print it.
@@ -27,6 +27,7 @@ Other (the middle is summarized by a model picked automatically from its size):
   /cc:autoresume on|off  after each compact, a daemon types /resume <fork> into your tmux pane (default off)
   /cc:autocompact N [msgs|ctx]  auto-/compact this pane at N tokens (default 300000, off disables; needs daemon + statusline export)
   /cc:continue MSG|off  after an auto-compacted resume, auto-send MSG e.g. continue (default off)
+  /cc:bigwindow N|off  Claude Code's own auto-compact window, every session (e.g. /cc:bigwindow 600k; N = 100k..1M)
   /cc:show           print current config
   /cc:reset          clear config (defaults restored)
   /cc:help           this help
@@ -49,6 +50,11 @@ Autonomous loop (UNATTENDED, no cap): /cc:autocompact N + /cc:continue MSG make 
 Window markers (daemon running, inside tmux): the window option @cc_state is ? when a dialog waits
   for you, $ when Claude finished while you weren't viewing that window, & when it's idle but
   background agents/shells still run. Add #{@cc_state} to window-status-format to see it (README).
+
+Big window: /cc:bigwindow N writes CLAUDE_CODE_AUTO_COMPACT_WINDOW into ~/.claude/settings.json, and
+  running sessions pick it up too. A subagent's compaction runs natively while its main session is
+  under min(0.85 x N, N - 60000); with it off, the plugin blocks those as well. While it's set,
+  Claude Code's own /autocompact can't change the window.
 
 Mutex per window (last command wins): /cc:begin clears head_pct; /cc:begin-pct clears head_tokens. Same for tail.
 Scope: ~/.claude/precompact.conf is global. Changes apply on the NEXT compact in any session — current, other running, or new. There is no per-session snapshot.

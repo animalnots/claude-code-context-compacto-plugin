@@ -121,7 +121,7 @@ Then re-run `/plugin install` if there are version changes.
 │       │   ├── pcconf.py               config helper for slash commands
 │       │   ├── rewrite_transcript.py   JSONL fork writer
 │       │   └── compacto-resume-daemon.sh  optional tmux auto-resume watcher
-│       ├── commands/                   /cc:begin /cc:end /cc:both /cc:begin-pct /cc:end-pct /cc:both-pct /cc:model /cc:autoresume /cc:autocompact /cc:continue /cc:show /cc:reset /cc:help
+│       ├── commands/                   /cc:begin /cc:end /cc:both /cc:begin-pct /cc:end-pct /cc:both-pct /cc:model /cc:autoresume /cc:autocompact /cc:continue /cc:bigwindow /cc:show /cc:reset /cc:help
 │       └── README.md                   plugin docs (full usage + config)
 ├── tests/                              pytest suite; not part of the installed plugin
 └── README.md                           this file
