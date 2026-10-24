@@ -53,8 +53,10 @@ Window markers (daemon running, inside tmux): the window option @cc_state is ? w
 
 Big window: /cc:bigwindow N writes CLAUDE_CODE_AUTO_COMPACT_WINDOW into ~/.claude/settings.json, and
   running sessions pick it up too. A subagent's compaction runs natively while its main session is
-  under min(0.85 x N, N - 60000); with it off, the plugin blocks those as well. While it's set,
-  Claude Code's own /autocompact can't change the window.
+  under min(0.85 x N, N - 60000), or when the subagent's transcript was written last and its context
+  is at or over that, while the main session's transcript has been still for 5 seconds; with it off,
+  the plugin blocks those as well. While it's set, Claude Code's own /autocompact can't change the
+  window.
 
 Mutex per window (last command wins): /cc:begin clears head_pct; /cc:begin-pct clears head_tokens. Same for tail.
 Scope: ~/.claude/precompact.conf is global. Changes apply on the NEXT compact in any session — current, other running, or new. There is no per-session snapshot.

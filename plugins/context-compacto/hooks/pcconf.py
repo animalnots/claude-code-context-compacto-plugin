@@ -286,12 +286,14 @@ def _report_window(value):
         print("That's too small for the plugin to tell a subagent's compaction from the main session's, "
               "so it blocks both.")
         return
-    print(f"A subagent's compaction runs natively while its main session is under {ceiling}.")
+    print(f"A subagent's compaction runs natively while its main session is under {ceiling}. Over it, "
+          f"one runs when the subagent's transcript was written last and its context is at or over "
+          f"{ceiling} too, while the main session's transcript has been still for 5 seconds.")
     over = _panes_over(ceiling)
     if not over:
         print(f"Panes at or over {ceiling}: none")
         return
-    print(f"Panes at or over {ceiling}, whose subagents can't compact:")
+    print(f"Panes at or over {ceiling}, where subagents compact only by that second rule:")
     for pane, name, tokens in over:
         print(f"  {pane}  {name}  {tokens}" if name else f"  {pane}  {tokens}")
 
@@ -386,8 +388,10 @@ Window markers (daemon running, inside tmux): the window option @cc_state is
 
 Big window: /cc:bigwindow N writes CLAUDE_CODE_AUTO_COMPACT_WINDOW into
   ~/.claude/settings.json, and running sessions pick it up too. A subagent's
-  compaction runs natively while its main session is under min(0.85 x N, N - 60000);
-  with it off, the plugin blocks those as well. While it's set, Claude Code's own
+  compaction runs natively while its main session is under min(0.85 x N, N - 60000),
+  or when the subagent's transcript was written last and its context is at or over
+  that, while the main session's transcript has been still for 5 seconds; with it
+  off, the plugin blocks those as well. While it's set, Claude Code's own
   /autocompact can't change the window.
 
 Mutex per window (last command wins): /cc:begin clears head_pct; /cc:begin-pct clears head_tokens.
