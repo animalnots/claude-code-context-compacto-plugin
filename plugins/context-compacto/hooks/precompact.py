@@ -8,14 +8,27 @@ produces:
     Claude Code can resume via `claude --resume <new-sid>`.
 
 Compactions inside a subagent pass through to Claude Code's native compaction.
-They are recognised by `agent_id` in the payload or, since Claude Code 2.1.300
-doesn't send it, by an auto trigger while the parent's context is under 85% of
-CLAUDE_CODE_AUTO_COMPACT_WINDOW and at least 60k tokens short of it (without that
-variable they are still blocked). An auto compaction in a tmux window whose name
-contains "!" is refused outright, with no fork and no /resume.
+They are recognised by `agent_id` in the payload. Claude Code 2.1.300 and later
+don't send it, so an auto trigger counts as a subagent's when either rule below
+holds. The cutoff is 85% of CLAUDE_CODE_AUTO_COMPACT_WINDOW or 60k tokens short
+of it, whichever is lower; without that variable neither rule applies.
+  - The parent's context is under the cutoff.
+  - The transcript written last, among the parent's and its subagents', is a
+    subagent's, from the last 60 s, with a context at or over the cutoff, and the
+    parent's hasn't changed for 5 s. It's checked after a 0.5 s wait, which lets
+    the transcript writes Claude Code still has pending land.
+Both rules run before the "!", "=" and handoff rules below, so subagents compact
+in those windows too. Known limits: a subagent on a model whose own window is
+under CLAUDE_CODE_AUTO_COMPACT_WINDOW compacts below the cutoff, so it's blocked
+while its parent is over the cutoff; and one compacting while the parent writes
+is blocked until a turn when the parent has been still for 5 s.
+Each decision on an auto compaction is a line in compactions.log in the signal
+directory.
 
-A compaction is also refused while this session's /compact-handoff is unfinished, and in a
-tmux window whose name contains "=" unless that handoff finished (see handoff.py).
+An auto compaction in a tmux window whose name contains "!" is refused outright,
+with no fork and no /resume. A compaction is also refused while this session's
+/compact-handoff is unfinished, and in a tmux window whose name contains "="
+unless that handoff finished (see handoff.py).
 
 Usage:
   python precompact.py [model]
@@ -66,6 +79,7 @@ Precedence per setting: env var > config file > built-in default.
 """
 import datetime
 import json
+import math
 import os
 import pathlib
 import re
@@ -73,6 +87,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 
 
 # Force UTF-8 on stdout/stderr so Windows consoles (cp1252 default) don't
@@ -200,8 +215,9 @@ def _context_tokens(e):
                                         "cache_read_input_tokens"))
 
 
-def _last_context_tokens(path, tail_bytes=4 << 20):
+def _last_context_tokens(path, tail_bytes=4 << 20, sidechain=False):
     # Tail first: a refused auto compaction repeats on every turn of a big session.
+    # A subagent's own transcript has only isSidechain entries, so `sidechain` reads those too.
     with open(path, "rb") as f:
         size = f.seek(0, os.SEEK_END)
         for start in ([size - tail_bytes, 0] if size > tail_bytes else [0]):
@@ -213,9 +229,45 @@ def _last_context_tokens(path, tail_bytes=4 << 20):
                 except ValueError:
                     continue
                 if (isinstance(e, dict) and e.get("type") == "assistant"
-                        and not e.get("isSidechain") and _context_tokens(e)):
+                        and (sidechain or not e.get("isSidechain")) and _context_tokens(e)):
                     return _context_tokens(e)
     return 0
+
+
+def _newest_subagent(parent_path):
+    """(agent id, transcript path, mtime) of the parent's subagent transcript written last, or None."""
+    newest = None
+    with os.scandir(os.path.join(os.path.splitext(parent_path)[0], "subagents")) as entries:
+        for e in entries:
+            if e.name.startswith("agent-") and e.name.endswith(".jsonl"):
+                mtime = e.stat().st_mtime
+                if newest is None or mtime > newest[2]:
+                    newest = (e.name[len("agent-"):-len(".jsonl")], e.path, mtime)
+    return newest
+
+
+def _subagent_facts(parent_path):
+    """Seconds since the parent's and its newest subagent's transcripts changed, and that subagent's id
+    and last context. Unknown values are None; an unreadable subagent transcript reads as 0 tokens."""
+    facts = dict.fromkeys(("parent_age", "subagent", "subagent_ctx", "subagent_age"))
+    try:
+        now = time.time()
+        facts["parent_age"] = now - os.stat(parent_path).st_mtime
+        sub = _newest_subagent(parent_path)
+        if sub:
+            facts.update(subagent=sub[0], subagent_ctx=0, subagent_age=now - sub[2])
+            facts["subagent_ctx"] = _last_context_tokens(sub[1], sidechain=True)
+    except Exception:
+        pass
+    return facts
+
+
+def _subagent_compacting(f, cutoff, settled=True):
+    # A compaction follows an entry its context has just made, which Claude Code writes about 0.1 s
+    # later: a main session written in the last few seconds may be the one compacting, and until the
+    # writes have settled, the compacting subagent's transcript may not look like the newest yet.
+    return (f["subagent"] is not None and f["parent_age"] >= 5 and f["subagent_ctx"] >= cutoff
+            and (not settled or (f["subagent_age"] < f["parent_age"] and f["subagent_age"] <= 60)))
 
 
 def _auto_compact_trigger_tokens():
@@ -242,25 +294,59 @@ def _window_name():
         return ""
 
 
+def _ledger(fields):
+    # compactions.log, cross-project and append-only: a line per compaction the plugin ran (section 9)
+    # and per decision on an auto compaction. Best-effort by design.
+    try:
+        SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
+        with (SIGNAL_DIR / "compactions.log").open("a", encoding="utf-8") as lf:
+            lf.write(f"{datetime.datetime.now():%F %T} session={session_id} trigger={trigger} "
+                     f"pane={TMUX_PANE or '-'} {fields}\n")
+    except Exception:
+        pass
+
+
+def _log_auto(decision, rule):
+    fields = dict(decision=decision, rule=rule, parent_ctx=parent_tokens, cutoff=cutoff, **facts)
+    _ledger(" ".join(f"{k}={'-' if v is None else round(v, 1) if isinstance(v, float) else v}"
+                     for k, v in fields.items()))
+
+
 if trigger == "auto":
-    # Claude Code 2.1.300 omits agent_id when a subagent compacts, so infer it: the parent only
-    # auto-compacts about 25-33k short of its window, so a parent well below that means a subagent.
+    # Claude Code 2.1.300+ omits agent_id when a subagent compacts, so infer it. The main session only
+    # auto-compacts about 25-33k short of its window, so one under the cutoff means a subagent. So does
+    # a big subagent transcript written after the main session's, while the main session's sits still.
     trigger_tokens = _auto_compact_trigger_tokens()
     parent_tokens = _last_context_tokens(transcript_path)
-    if trigger_tokens and 0 < parent_tokens < min(trigger_tokens * 0.85, trigger_tokens - 60000):
+    cutoff = math.ceil(min(trigger_tokens * 0.85, trigger_tokens - 60000)) if trigger_tokens else 0
+    cutoff = cutoff if cutoff > 0 else None
+    facts = _subagent_facts(transcript_path)
+    if cutoff and 0 < parent_tokens < cutoff:
+        _log_auto("pass", "parent-under-cutoff")
         sys.exit(0)
+    if cutoff and _subagent_compacting(facts, cutoff, settled=False):
+        time.sleep(0.5)   # long enough for pending transcript writes to land
+        facts = _subagent_facts(transcript_path)
+        if _subagent_compacting(facts, cutoff):
+            _log_auto("pass", "subagent-transcript")
+            sys.exit(0)
 window_name = _window_name()
 # The resume daemon's opt-out: a "!" in the tmux window name means never auto-compact. Block
 # Claude Code's own auto compaction there too, without forking or arming /resume.
 if trigger == "auto" and "!" in window_name:
+    _log_auto("refuse", "bang-window")
     print(json.dumps({"decision": "block",
                       "reason": "precompact: '!' in the tmux window name opts this session out of auto-compaction"}))
     sys.exit(0)
 if handoff is not None:
     handoff_block = handoff.check_compaction(session_id, trigger, window_name)
     if handoff_block:
+        if trigger == "auto":
+            _log_auto("refuse", "handoff")
         print(json.dumps({"decision": "block", "reason": handoff_block}))
         sys.exit(0)
+if trigger == "auto":
+    _log_auto("refuse", "main-session")   # the plugin compacts it below, as the main session's
 
 
 # ---- 4. Read transcript --------------------------------------------------
@@ -579,23 +665,12 @@ if summary and rewrite_transcript is not None:
 elif summary is None:
     fork_error = "no summary, fork skipped"
 
-# Executions ledger: one line per compaction that actually RAN, cross-project and
-# append-only. The daemon's events.log records what was *typed* (fires); this records
-# what *executed* — a fire with no matching line here means the /compact was eaten or
-# is still frozen in the pane's queue. That distinction took hours of preview-directory
-# archaeology to reconstruct after the fact; now it's one grep. Best-effort by design.
-try:
-    _ledger_dir = pathlib.Path(
-        os.environ.get("COMPACTO_SIGNAL_DIR", "") or str(pathlib.Path.home() / ".claude" / "compacto-signals")
-    )
-    _ledger_dir.mkdir(parents=True, exist_ok=True)
-    with (_ledger_dir / "compactions.log").open("a", encoding="utf-8") as _lf:
-        _lf.write(
-            f"{datetime.datetime.now():%F %T} session={session_id} trigger={trigger} "
-            f"pane={TMUX_PANE or '-'} msgs={N} fork={fork_id or f'FAILED({fork_error})'}\n"
-        )
-except Exception:
-    pass
+# Executions ledger: one line per compaction that actually RAN. The daemon's events.log
+# records what was *typed* (fires); this records what *executed* — a fire with no matching
+# line here means the /compact was eaten or is still frozen in the pane's queue. That
+# distinction took hours of preview-directory archaeology to reconstruct after the fact;
+# now it's one grep.
+_ledger(f"msgs={N} fork={fork_id or f'FAILED({fork_error})'}")
 
 
 # ---- 9b. Arm auto-resume (opt-in, tmux-only) -----------------------------
