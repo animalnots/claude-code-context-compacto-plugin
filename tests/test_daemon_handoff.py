@@ -34,9 +34,11 @@ class Rig:
         self.daemon = None
         self.target = None
 
-    def start(self, window, msgs, handoff="ok", hooked=True, draft="", daemon=True):
+    def start(self, window, msgs, handoff="ok", hooked=True, draft="", daemon=True, resume="ok", ctx=True,
+              compact="ok"):
         cmd = [sys.executable, str(FAKE), "--log", str(self.log), "--transcript", str(self.transcript),
-               "--msgs", str(msgs), "--handoff", handoff] + (["--hooked"] if hooked else [])
+               "--msgs", str(msgs), "--handoff", handoff, "--resume", resume, "--compact", compact] \
+            + (["--hooked"] if hooked else []) + ([] if ctx else ["--no-ctx"])
         subprocess.run(self.tmux + ["new-session", "-d", "-s", "t", "-n", window, "-x", "120", "-y", "30",
                                     " ".join(cmd)], env=self.env, check=True)
         self.target = subprocess.run(self.tmux + ["display-message", "-p", "-t", "t", "#{pane_id}"],
@@ -77,6 +79,25 @@ class Rig:
 
     def typed(self):
         return [e[len("TYPED "):] for e in self.events() if e.startswith("TYPED ")]
+
+    def wait_typed(self, n, timeout=30):
+        end = time.time() + timeout
+        while len(self.typed()) < n and time.time() < end:
+            time.sleep(0.1)
+        return self.typed()
+
+    def signal(self, suffix):
+        return self.signals / f"{self.target.lstrip('%')}.{suffix}"
+
+    def want(self, size):
+        """A compaction left to the daemon at this size, as the hook leaves Claude Code's own one."""
+        self.signal("compactwant").write_text(f"{size}\n")
+
+    def fork(self, fork, age=0):
+        """The hook's /resume signal for a fork written age seconds ago."""
+        p = self.signal("resume")
+        p.write_text(f"{self.target}\t{fork}\n")
+        os.utime(p, (time.time() - age, time.time() - age))
 
     def stop(self):
         if self.daemon:
@@ -188,3 +209,162 @@ def test_a_draft_in_the_input_box_holds_the_handoff(rig):
     assert rig.typed() == []
     rig.keys(*["BSpace"] * 5)
     rig.wait_for("TYPED /compact-handoff")
+
+
+def test_claude_codes_own_compaction_mid_turn_runs_at_the_next_idle_prompt(rig):
+    rig.start("gloss", 100000)
+    rig.keys("turn", "Enter")
+    typed = rig.wait_typed(3)
+    assert typed[:2] == ["turn", "/compact"] and typed[2].startswith("/resume ")
+    assert "AUTO_COMPACT_BLOCKED precompact: the resume daemon compacts this pane once the turn ends" in rig.events()
+    assert rig.times("TYPED /compact")[0] > rig.times("IDLE")[0]
+    assert ", asked by Claude Code" in rig.daemon_log()
+    assert not rig.signal("compactwant").exists()
+
+
+def test_a_left_compaction_is_dropped_once_the_session_is_smaller(rig):
+    rig.start("gloss", 100000, daemon=False)
+    rig.want(200000)
+    rig.start_daemon()
+    time.sleep(3)
+    assert rig.typed() == []
+    assert not rig.signal("compactwant").exists()
+
+
+@pytest.mark.parametrize("window", ["gloss=", "gloss!"])
+def test_equals_and_bang_windows_drop_a_left_compaction(rig, window):
+    rig.start(window, 100000, daemon=False)
+    rig.want(100000)
+    rig.start_daemon()
+    time.sleep(3)
+    assert rig.typed() == []
+    assert not rig.signal("compactwant").exists()
+
+
+def test_a_fork_older_than_the_panes_last_turn_is_compacted_afresh_instead_of_resumed(rig):
+    rig.start("gloss", 100000, daemon=False)    # its Stop stamps the pane's last turn now
+    rig.fork("stale-fork", age=5)
+    rig.start_daemon()
+    typed = rig.wait_typed(2)
+    assert typed[0] == "/compact" and typed[1].startswith("/resume ")
+    assert "/resume stale-fork" not in typed
+    assert "resume-stale" in rig.daemon_log()
+
+
+def test_a_fork_newer_than_the_panes_last_turn_is_resumed_before_a_left_compaction(rig):
+    rig.start("gloss", 100000, daemon=False)
+    time.sleep(1.1)
+    rig.fork("fresh-fork")
+    rig.want(100000)
+    rig.start_daemon()
+    rig.wait_for("TYPED /resume fresh-fork")
+    time.sleep(3)
+    assert rig.typed() == ["/resume fresh-fork"]
+    assert not rig.signal("compactwant").exists()
+
+
+@pytest.mark.parametrize("why", ["no size export", "threshold compaction off", "a ! window", "no size reported yet",
+                                 "msgs it can't read", "a = window before its handoff",
+                                 "a = window after another session's handoff"])
+def test_where_the_daemon_cannot_compact_afresh_a_stale_fork_is_still_resumed(rig, why):
+    if why == "threshold compaction off":
+        (rig.home / ".claude" / "precompact.conf").write_text("auto_compact_at=0\nauto_resume=1\n")
+    window = "gloss!" if why == "a ! window" else "gloss=" if why.startswith("a = window") else "gloss"
+    rig.start(window, 0 if why == "no size reported yet" else 100000,
+              daemon=False, ctx=why not in ("no size export", "msgs it can't read"))
+    if why == "msgs it can't read":
+        rig.signal("ctx").write_text(f"{rig.target}\t100000\t100k\n")
+    if why == "a = window after another session's handoff":
+        now = int(time.time())
+        rig.signal("handoff").write_text(f"done\t{uuid.uuid4()}\tp1\t{now - 1000}\t{now - 990}\n")
+    rig.fork("stale-fork", age=5)
+    rig.start_daemon()
+    rig.wait_for("TYPED /resume stale-fork")
+
+
+def test_a_resume_the_session_swallowed_is_not_resent_after_the_turn_it_ran(rig):
+    rig.start("gloss", 300000, resume="eat,ok")
+    typed = rig.wait_typed(4)
+    resumes = [t for t in typed if t.startswith("/resume ")]
+    assert typed[:4] == ["/compact", resumes[0], "/compact", resumes[1]] and resumes[0] != resumes[1]
+    assert "resume-stale" in rig.daemon_log()
+
+
+def test_the_daemon_keeps_a_heartbeat_only_while_it_runs(rig):
+    rig.start("gloss", 1000)
+    beat = rig.signals / ".daemon.lock" / "heartbeat"
+    end = time.time() + 5
+    while not beat.exists() and time.time() < end:
+        time.sleep(0.1)
+    first = beat.stat().st_mtime
+    time.sleep(1.5)
+    assert beat.stat().st_mtime > first
+    rig.daemon.terminate()
+    rig.daemon.wait(timeout=10)
+    assert not beat.exists()
+
+
+def test_in_an_equals_window_a_fork_from_before_a_handoff_is_compacted_afresh_after_it(rig):
+    rig.start("gloss=", 100000, daemon=False)
+    rig.fork("pre-handoff-fork", age=5)
+    rig.keys("/compact-handoff", "Enter")
+    rig.wait_for("IDLE")
+    rig.start_daemon()
+    typed = rig.wait_typed(3)
+    assert typed[:2] == ["/compact-handoff", "/compact"] and typed[2].startswith("/resume ")
+    assert "/resume pre-handoff-fork" not in typed
+    assert "resume-stale" in rig.daemon_log()
+
+
+def test_a_compaction_asked_for_soon_after_the_last_one_is_not_held_by_its_line_on_screen(rig):
+    rig.start("gloss", 100000, daemon=False)
+    rig.want(100000)
+    rig.start_daemon()
+    rig.wait_for("TYPED /resume ")       # the fork shows that "❯ /compact" in its tail
+    time.sleep(2)                        # past the re-arm grace, as a fork that grows back takes far longer
+    rig.want(1000)
+    typed = rig.wait_typed(4)
+    assert typed[2] == "/compact" and typed[3].startswith("/resume ")
+
+
+def test_a_compaction_asked_for_again_while_the_last_one_is_stuck_in_the_queue_is_not_stacked(rig):
+    rig.start("gloss", 100000, daemon=False, compact="freeze")
+    rig.want(100000)
+    rig.start_daemon()
+    rig.wait_for("FROZEN")
+    time.sleep(0.5)                      # the daemon drops the reading it fired on; the statusline writes the next
+    rig.signal("ctx").write_text(f"{rig.target}\t100000\t100000\n")
+    rig.want(100000)                     # Claude Code asked again, in a turn the stuck /compact waited behind
+    time.sleep(4)                        # past the re-arm grace and the floor between compactions
+    assert rig.typed() == ["/compact"]
+
+
+def test_a_fork_written_while_the_daemon_holds_an_older_one_is_not_overwritten(rig):
+    rig.start("gloss", 100000, daemon=False)
+    rig.fork("old-fork")
+    rig.start_daemon()
+    end = time.time() + 10
+    while not rig.signal("resume.busy").exists() and time.time() < end:
+        time.sleep(0.05)
+    rig.fork("new-fork")                 # the hook's next fork, while the daemon settles before typing the old one
+    rig.keys("work", "Enter")
+    rig.wait_for("TYPED /resume ")
+    assert rig.typed() == ["work", "/resume new-fork"]
+
+
+def test_in_an_equals_window_a_fork_a_turn_outlived_after_its_handoff_is_compacted_afresh(rig):
+    rig.start("gloss=", 600000, resume="eat,ok")
+    typed = rig.wait_typed(5)
+    resumes = [t for t in typed if t.startswith("/resume ")]
+    assert typed[:5] == ["/compact-handoff", "/compact", resumes[0], "/compact", resumes[1]] and resumes[0] != resumes[1]
+    assert "resume-stale" in rig.daemon_log()
+
+
+def test_a_draft_in_the_input_box_holds_a_left_compaction(rig):
+    rig.start("gloss", 100000, daemon=False, draft="hello")
+    rig.want(100000)
+    rig.start_daemon()
+    time.sleep(3)
+    assert rig.typed() == []
+    rig.keys(*["BSpace"] * 5)
+    rig.wait_for("TYPED /compact")

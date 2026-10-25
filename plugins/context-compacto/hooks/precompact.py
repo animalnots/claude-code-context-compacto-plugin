@@ -28,7 +28,10 @@ directory.
 An auto compaction in a tmux window whose name contains "!" is refused outright,
 with no fork and no /resume. A compaction is also refused while this session's
 /compact-handoff is unfinished, and in a tmux window whose name contains "="
-unless that handoff finished (see handoff.py).
+unless that handoff finished (see handoff.py). In any other pane the resume daemon
+watches, an auto compaction is refused with no fork too: it comes mid-turn, so the
+fork would miss the rest of the turn. The hook leaves <pane>.compactwant, and the
+daemon compacts the pane at its next idle prompt.
 
 Usage:
   python precompact.py [model]
@@ -165,6 +168,10 @@ SIGNAL_DIR = pathlib.Path(
     os.environ.get("COMPACTO_SIGNAL_DIR")
     or pathlib.Path.home() / ".claude" / "compacto-signals"
 )
+# The resume daemon rewrites this every poll. Daemons from before 1.5.16 don't, and they would never
+# run a compaction left to them, so only a fresh one counts as a daemon that will.
+DAEMON_HEARTBEAT = SIGNAL_DIR / ".daemon.lock" / "heartbeat"
+DAEMON_HEARTBEAT_MAX_AGE = 60
 
 cwd_dir = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
 out_dir = pathlib.Path(cwd_dir) / ".claude" / "summaries"
@@ -294,6 +301,45 @@ def _window_name():
         return ""
 
 
+def _pane_key():
+    key = "".join(c for c in TMUX_PANE if c.isalnum()) or "pane"
+    return f"{PSMUX_SERVER}_{key}" if PSMUX_SERVER else key
+
+
+def _daemon_threshold_on():
+    # Read as the daemon's conf_get reads it, without stripping spaces or a CR, so that wherever the two
+    # could differ the hook takes it as off and forks as before, rather than leave a compaction nobody runs.
+    try:
+        text = PCCONF.read_bytes().decode("utf-8")
+    except FileNotFoundError:
+        text = ""
+    except (OSError, ValueError):
+        return False
+    values = [ln[len("auto_compact_at="):] for ln in text.split("\n") if ln.startswith("auto_compact_at=")]
+    at = values[-1] if values else ""
+    return at == "" or (re.fullmatch(r"[0-9]+", at) is not None and int(at) > 0)
+
+
+def _size_if_daemon_compacts_at_idle():
+    """This pane's exported context size when the resume daemon will /compact it at its next idle prompt, else
+    None. That takes a running daemon, auto-resume on, threshold compaction not off, and the pane's size export,
+    since the daemon only watches panes that export their size."""
+    if not (AUTO_RESUME and TMUX_PANE and handoff is not None and _daemon_threshold_on()):
+        return None
+    try:
+        if time.time() - DAEMON_HEARTBEAT.stat().st_mtime > DAEMON_HEARTBEAT_MAX_AGE:
+            return None
+        line = (SIGNAL_DIR / f"{_pane_key()}.ctx").read_bytes().decode("utf-8").split("\n")[0]
+    except (OSError, ValueError):
+        return None
+    # Read as the daemon reads it, only a trailing CR stripped. Both numbers must be plain: the daemon skips a pane
+    # whose metric (msgs by default) isn't one. A size of 0 is a session that hasn't reported its size yet.
+    sizes = [f[:-1] if f.endswith("\r") else f for f in line.split("\t")[1:3]]
+    if len(sizes) < 2 or not all(re.fullmatch(r"[0-9]+", s) for s in sizes) or int(sizes[0]) == 0:
+        return None
+    return int(sizes[0])
+
+
 def _ledger(fields):
     # compactions.log, cross-project and append-only: a line per compaction the plugin ran (section 9)
     # and per decision on an auto compaction. Best-effort by design.
@@ -346,6 +392,19 @@ if handoff is not None:
         print(json.dumps({"decision": "block", "reason": handoff_block}))
         sys.exit(0)
 if trigger == "auto":
+    # A fork made now would miss the rest of this turn, and the daemon only resumes once the turn is over, so
+    # let it compact then: the hook runs again for its /compact, at the idle prompt.
+    pane_size = _size_if_daemon_compacts_at_idle()
+    if pane_size is not None:
+        try:
+            handoff._write(SIGNAL_DIR / f"{_pane_key()}.compactwant", f"{pane_size}\n")
+        except OSError:
+            pane_size = None   # the daemon would never hear of it
+    if pane_size is not None:
+        _log_auto("refuse", "daemon")
+        print(json.dumps({"decision": "block",
+                          "reason": "precompact: the resume daemon compacts this pane once the turn ends"}))
+        sys.exit(0)
     _log_auto("refuse", "main-session")   # the plugin compacts it below, as the main session's
 
 
@@ -683,9 +742,7 @@ if fork_id and AUTO_RESUME:
     if TMUX_PANE:
         try:
             SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
-            pane_key = "".join(c for c in TMUX_PANE if c.isalnum()) or "pane"
-            if PSMUX_SERVER:
-                pane_key = f"{PSMUX_SERVER}_{pane_key}"
+            pane_key = _pane_key()
             sig = SIGNAL_DIR / f"{pane_key}.resume"
             tmp = SIGNAL_DIR / f"{pane_key}.resume.tmp"
             # Line is  <exact-pane-id>\t<fork-id>[\t<psmux-server-pid>]  — the daemon targets the

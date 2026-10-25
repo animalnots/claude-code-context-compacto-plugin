@@ -113,6 +113,18 @@ def hook(env, tmp_path, tmux):
         def log(self):
             p = signals / "compactions.log"
             return p.read_text().splitlines() if p.exists() else []
+
+        def served(self, ctx=55000, msgs=None, heartbeat_age=0, conf="auto_resume=1\n"):
+            """The resume daemon watches this pane: it runs, auto-resume is on and the pane exports its size."""
+            (pathlib.Path(env["HOME"]) / ".claude" / "precompact.conf").write_text(conf)
+            if ctx is not None:
+                (signals / f"{key}.ctx").write_text(f"{pane}\t{ctx}\t{ctx if msgs is None else msgs}\n")
+            if heartbeat_age is not None:
+                aged(signals / ".daemon.lock" / "heartbeat", "", heartbeat_age)
+
+        def want(self):
+            p = signals / f"{key}.compactwant"
+            return p.read_text() if p.exists() else None
     return Hook()
 
 
@@ -325,3 +337,75 @@ def test_a_subagent_write_that_lands_while_the_hook_decides_is_seen(big, tmp_pat
 
     big.subagent(CUTOFF + 30000, age=90)   # its last write was before a slow tool call
     assert big.decide_racing(subagent_writes) is None
+
+
+LEFT_TO_DAEMON = "the resume daemon compacts this pane once the turn ends"
+
+
+@pytest.mark.parametrize("conf", ["auto_resume=1\n", "auto_compact_at=265000\nauto_resume=1\n"])
+def test_in_a_pane_the_daemon_watches_auto_compaction_waits_for_its_idle_prompt(big, tmp_path, conf):
+    big.served(conf=conf)
+    assert LEFT_TO_DAEMON in big.decide()
+    assert big.want() == "55000\n"
+    [line] = big.log()
+    assert f" decision=refuse rule=daemon parent_ctx={CUTOFF + 15000} cutoff={CUTOFF} parent_age=" in line
+    assert not list((tmp_path / "proj" / ".claude" / "summaries").iterdir())
+
+
+def test_without_a_window_size_a_watched_pane_still_waits_for_the_daemon(hook):
+    hook.served()
+    assert LEFT_TO_DAEMON in hook.run("auto")
+
+
+@pytest.mark.parametrize("setup", [
+    dict(heartbeat_age=None),                          # no daemon, or one that predates the heartbeat
+    dict(heartbeat_age=120),                           # a daemon that died
+    dict(conf="auto_compact_at=0\nauto_resume=1\n"),   # threshold compaction off
+    dict(conf="auto_compact_at=300k\nauto_resume=1\n"),
+    dict(conf="auto_compact_at=265000 \nauto_resume=1\n"),       # the daemon reads that as no number: off
+    dict(conf="auto_compact_at=265000\r\nauto_resume=1\r\n"),
+    dict(conf=""),                                     # auto-resume off
+    dict(ctx=None),                                    # the pane doesn't export its size
+    dict(ctx="n/a"),
+    dict(ctx=0),                                       # a session that hasn't reported its size yet
+    dict(ctx="55000 "),                                # the daemon reads that as no number
+    dict(msgs="55k"),                                  # the daemon skips a pane whose msgs it can't read
+])
+def test_where_the_daemon_wont_compact_at_idle_the_hook_forks_as_before(big, setup):
+    big.served(**setup)
+    assert PASSED in big.decide()
+    assert big.want() is None
+    assert " decision=refuse rule=main-session " in big.log()[0]
+
+
+def test_a_compaction_typed_in_a_watched_pane_runs_at_once(big):
+    big.served()
+    assert PASSED in big.decide("manual")
+    assert big.want() is None
+
+
+@pytest.mark.parametrize("name, rule", [("gloss!", "bang-window"), ("gloss=", "handoff")])
+def test_bang_and_equals_windows_keep_their_own_rules_in_a_watched_pane(big, name, rule):
+    big.window(name)
+    big.served()
+    assert big.decide() is not None
+    assert f" decision=refuse rule={rule} " in big.log()[0]
+    assert big.want() is None
+
+
+def test_a_subagent_still_compacts_natively_in_a_watched_pane(big):
+    big.served()
+    big.subagent(CUTOFF + 30000, age=1)
+    assert big.decide() is None
+    assert big.want() is None
+
+
+def test_when_the_daemon_cannot_be_told_the_hook_forks_as_before(big, env):
+    big.served()
+    signals = pathlib.Path(env["COMPACTO_SIGNAL_DIR"])
+    signals.chmod(0o555)
+    try:
+        assert PASSED in big.decide()
+    finally:
+        signals.chmod(0o755)
+    assert big.want() is None

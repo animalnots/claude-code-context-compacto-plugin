@@ -24,7 +24,14 @@ ap.add_argument("--msgs", type=int, required=True)
 # (another Stop hook keeps the turn going after ours ran), interrupt (Esc, so no Stop, then a
 # later turn's Stop), apierror (StopFailure), ignore.
 ap.add_argument("--handoff", default="ok")
+# How each typed /resume plays out, in the same way: ok, or eat (a turn of its own runs instead and the
+# session stays, as when a self-continuing agent's next turn swallows the keys).
+ap.add_argument("--resume", default="ok")
+# How each typed /compact plays out, in the same way: ok, or freeze (it stays queued and never runs, while the
+# pane looks idle, as a queue that froze behind a turn).
+ap.add_argument("--compact", default="ok")
 ap.add_argument("--hooked", action="store_true", help="this session runs the plugin's Stop hook")
+ap.add_argument("--no-ctx", action="store_true", help="this session's statusline doesn't export its size")
 args = ap.parse_args()
 
 pane = os.environ["TMUX_PANE"]
@@ -33,6 +40,10 @@ signals = pathlib.Path(os.environ["COMPACTO_SIGNAL_DIR"])
 session = str(uuid.uuid4())
 msgs = args.msgs
 scenarios = args.handoff.split(",")
+resumes = args.resume.split(",")
+compacts = args.compact.split(",")
+# Lines of the conversation still on screen. A /compact that ran stays there, as in a resumed fork.
+history = []
 
 
 def log(event):
@@ -42,9 +53,11 @@ def log(event):
 
 def render(busy):
     status = "✳ Working… (3s · ↓ 1.2k tokens)" if busy else "✻ Worked for 3s · done 11:09"
-    sys.stdout.write("\033[2J\033[H⏺ fake claude\n\n" + status + "\n" + "─" * 40 + "\n❯\u00a0")
+    sys.stdout.write("\033[2J\033[H⏺ fake claude\n" + "".join(h + "\n" for h in history) + "\n" + status + "\n"
+                     + "─" * 40 + "\n❯\u00a0")
     sys.stdout.flush()
-    (signals / f"{key}.ctx").write_text(f"{pane}\t{msgs}\t{msgs}\n")
+    if not args.no_ctx:
+        (signals / f"{key}.ctx").write_text(f"{pane}\t{msgs}\t{msgs}\n")
 
 
 def hook(script, payload):
@@ -96,12 +109,27 @@ def handoff(command):
     log("IDLE")
 
 
-def compact():
-    render(True)
+def precompact(trigger):
     out = hook("precompact.py", {"hook_event_name": "PreCompact", "session_id": session, "prompt_id": "",
-                                 "transcript_path": args.transcript, "trigger": "manual",
+                                 "transcript_path": args.transcript, "trigger": trigger,
                                  "custom_instructions": None})
-    reason = json.loads(out)["reason"] if out else ""
+    return json.loads(out)["reason"] if out else ""
+
+
+def turn():
+    """A turn past Claude Code's own compaction point, where it asks to auto-compact before an API call."""
+    busy_for(0.5)
+    log(f"AUTO_COMPACT_BLOCKED {precompact('auto')}")
+    busy_for(0.5)
+    stop(str(uuid.uuid4()))
+    render(False)
+    log("IDLE")
+
+
+def compact():
+    history.append("❯ /compact")
+    render(True)
+    reason = precompact("manual")
     if "transcript too short" in reason:
         fork = str(uuid.uuid4())
         (signals / f"{key}.resume").write_text(f"{pane}\t{fork}\n")
@@ -120,9 +148,25 @@ for line in sys.stdin:
     cmd = line.strip()
     log(f"TYPED {cmd}")
     if cmd == "/compact":
-        compact()
+        if (compacts.pop(0) if len(compacts) > 1 else compacts[0]) == "freeze":
+            history.append("❯ /compact")
+            render(False)
+            log("FROZEN")
+        else:
+            compact()
+    elif cmd == "turn":
+        turn()
+    elif cmd == "work":
+        busy_for(3)       # a turn cut short with Esc: no Stop
+        render(False)
     elif cmd.startswith("/resume "):
-        session, msgs = str(uuid.uuid4()), 1000
+        if (resumes.pop(0) if len(resumes) > 1 else resumes[0]) == "eat":
+            busy_for(1)
+            stop(str(uuid.uuid4()))
+            log("ATE_RESUME")
+        else:
+            time.sleep(0.3)   # loading the fork, so its size lands after the daemon drops the old one
+            session, msgs = str(uuid.uuid4()), 1000
         render(False)
     elif cmd.startswith("/"):
         handoff(cmd[1:])
