@@ -82,7 +82,7 @@ Go further and let a long task run *itself* across compactions: **auto-compact a
 /cc:continue continue      # after each auto-compaction resumes, send "continue"
 ```
 
-**⚠ Unbounded and hands-off** — compact → resume → continue → repeat, spending tokens with no human and no cap until you stop the daemon (`Ctrl-C`) or run `/cc:autocompact off`. It also needs a small export added to your statusline so the daemon can read the live context size. A `!` in a tmux window's name exempts that window; a `=` makes it run `/compact-handoff` at twice the threshold and compact only after that handoff has finished. Setup, safeguards, and idle-detection tuning are in the [plugin README](plugins/context-compacto/README.md#autonomous-loop-auto-compact--continue--advanced-unattended); on Windows, see [Windows (psmux)](plugins/context-compacto/README.md#windows-psmux).
+**⚠ Unbounded and hands-off** — compact → resume → continue → repeat, spending tokens with no human and no cap until you stop the daemon (`Ctrl-C`) or run `/cc:autocompact off`. It also needs a small export added to your statusline so the daemon can read the live context size. A `!` in a tmux window's name exempts that window; a `=` makes it run `/compact-handoff` at twice the threshold and compact only after that handoff has finished. Elsewhere, Claude Code's own mid-turn auto compaction is left to the daemon, which compacts at the next idle prompt so the fork keeps the whole turn. Setup, safeguards, and idle-detection tuning are in the [plugin README](plugins/context-compacto/README.md#autonomous-loop-auto-compact--continue--advanced-unattended); on Windows, see [Windows (psmux)](plugins/context-compacto/README.md#windows-psmux).
 
 ## Requirements
 

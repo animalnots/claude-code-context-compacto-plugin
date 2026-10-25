@@ -380,6 +380,8 @@ Autonomous loop (UNATTENDED, no cap): /cc:autocompact N + /cc:continue MSG make 
   /compact-handoff (handoff_command=NAME in the config file), waits for that turn
   to finish, then types /compact. While a /compact-handoff you typed is unfinished,
   /compact is refused once (repeat it within 2 minutes to compact anyway).
+  In other windows, Claude Code's own auto compaction (it fires mid-turn) is left
+  to the daemon, which /compacts the pane at its next idle prompt.
 
 Window markers (daemon running, inside tmux): the window option @cc_state is
   ? when a dialog waits for you, $ when Claude finished while you weren't viewing
