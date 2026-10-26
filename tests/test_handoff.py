@@ -114,12 +114,20 @@ def test_a_finished_handoff_ignores_later_stops(env):
     assert read_fields(env)[0] == "done"
 
 
-def test_stop_stamps_the_pane_as_hooked(env, tmp_path):
+def test_stop_stamps_the_pane_with_its_session_and_turn(env, tmp_path):
     transcript = tmp_path / "t.jsonl"
     transcript.write_text("{}\n")
     run_hook("handoff.py", stop(transcript=transcript), env)
     stamp = pathlib.Path(env["COMPACTO_SIGNAL_DIR"]) / "7.hooked"
-    assert stamp.read_text().strip() == S1
+    assert stamp.read_text() == f"{S1}\n{P1}\n"
+
+
+def test_a_stop_without_a_prompt_id_stamps_only_the_session(env, tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("{}\n")
+    run_hook("handoff.py", stop(prompt=None, transcript=transcript), env)
+    stamp = pathlib.Path(env["COMPACTO_SIGNAL_DIR"]) / "7.hooked"
+    assert stamp.read_text() == f"{S1}\n"
 
 
 @pytest.mark.parametrize("transcript", ["missing.jsonl", None])

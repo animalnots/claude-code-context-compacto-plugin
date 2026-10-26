@@ -22,7 +22,8 @@ ap.add_argument("--transcript", required=True)
 ap.add_argument("--msgs", type=int, required=True)
 # How each typed handoff plays out, comma-separated in order (the last one repeats): ok, slowstop
 # (another Stop hook keeps the turn going after ours ran), interrupt (Esc, so no Stop, then a
-# later turn's Stop), apierror (StopFailure), ignore.
+# later turn's Stop), late (a background result that arrived meanwhile runs its own turn straight
+# after), apierror (StopFailure), ignore.
 ap.add_argument("--handoff", default="ok")
 # How each typed /resume plays out, in the same way: ok, or eat (a turn of its own runs instead and the
 # session stays, as when a self-continuing agent's next turn swallows the keys).
@@ -31,6 +32,7 @@ ap.add_argument("--resume", default="ok")
 # pane looks idle, as a queue that froze behind a turn).
 ap.add_argument("--compact", default="ok")
 ap.add_argument("--hooked", action="store_true", help="this session runs the plugin's Stop hook")
+ap.add_argument("--old-hooks", action="store_true", help="its Stop hook stamps the session but not the turn")
 ap.add_argument("--no-ctx", action="store_true", help="this session's statusline doesn't export its size")
 args = ap.parse_args()
 
@@ -69,6 +71,9 @@ def hook(script, payload):
 def stop(prompt, event="Stop", active=False):
     hook("handoff.py", {"hook_event_name": event, "session_id": session, "prompt_id": prompt,
                         "transcript_path": args.transcript, "stop_hook_active": active, "background_tasks": []})
+    stamp = signals / f"{key}.hooked"
+    if args.old_hooks and stamp.exists():
+        stamp.write_text(session + "\n")
 
 
 def busy_for(secs):
@@ -96,6 +101,10 @@ def handoff(command):
         stop(prompt)
         busy_for(3)
         stop(prompt, active=True)
+    elif how == "late":
+        stop(prompt)
+        busy_for(1.5)
+        stop(str(uuid.uuid4()))
     elif how == "apierror":
         stop(prompt, event="StopFailure")
     elif how == "interrupt":

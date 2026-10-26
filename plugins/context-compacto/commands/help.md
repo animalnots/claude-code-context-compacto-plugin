@@ -44,6 +44,7 @@ Autonomous loop (UNATTENDED, no cap): /cc:autocompact N + /cc:continue MSG make 
   a /compact you type there is still auto-resumed).
   A = instead (no !) hands off first: at min(600000, 2 x N) the daemon types /compact-handoff
   (handoff_command=NAME in the config file), waits for that turn to finish, then types /compact.
+  A turn that ends after the handoff, or after its fork and before /resume, brings a fresh handoff.
   While a /compact-handoff you typed is unfinished, /compact is refused once (repeat it within 2
   minutes to compact anyway).
 

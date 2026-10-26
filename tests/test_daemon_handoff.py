@@ -35,10 +35,11 @@ class Rig:
         self.target = None
 
     def start(self, window, msgs, handoff="ok", hooked=True, draft="", daemon=True, resume="ok", ctx=True,
-              compact="ok"):
+              compact="ok", old_hooks=False):
         cmd = [sys.executable, str(FAKE), "--log", str(self.log), "--transcript", str(self.transcript),
                "--msgs", str(msgs), "--handoff", handoff, "--resume", resume, "--compact", compact] \
-            + (["--hooked"] if hooked else []) + ([] if ctx else ["--no-ctx"])
+            + (["--hooked"] if hooked else []) + ([] if ctx else ["--no-ctx"]) \
+            + (["--old-hooks"] if old_hooks else [])
         subprocess.run(self.tmux + ["new-session", "-d", "-s", "t", "-n", window, "-x", "120", "-y", "30",
                                     " ".join(cmd)], env=self.env, check=True)
         self.target = subprocess.run(self.tmux + ["display-message", "-p", "-t", "t", "#{pane_id}"],
@@ -149,6 +150,20 @@ def test_compact_waits_until_the_handoff_turn_really_ends(rig):
     rig.start("gloss=", 600000, handoff="slowstop")
     rig.wait_for("COMPACTED")
     assert rig.times("TYPED /compact")[-1] > rig.times("IDLE")[0]
+    assert rig.typed()[:2] == ["/compact-handoff", "/compact"]   # the second Stop ends the same turn
+
+
+def test_a_turn_that_ends_between_the_handoff_and_compact_brings_a_fresh_handoff(rig):
+    rig.start("gloss=", 600000, handoff="late,ok")
+    rig.wait_for("COMPACTED", timeout=30)
+    assert rig.typed()[:3] == ["/compact-handoff", "/compact-handoff", "/compact"]
+    assert "handoff-redo" in rig.daemon_log()
+
+
+def test_with_hooks_that_stamp_no_turn_a_handoff_is_still_followed_by_compact(rig):
+    rig.start("gloss=", 600000, handoff="late", old_hooks=True)
+    rig.wait_for("COMPACTED", timeout=30)
+    assert rig.typed()[:2] == ["/compact-handoff", "/compact"]
 
 
 @pytest.mark.parametrize("handoff,why", [("interrupt", "cut short"), ("apierror", "API error"),
@@ -264,22 +279,43 @@ def test_a_fork_newer_than_the_panes_last_turn_is_resumed_before_a_left_compacti
 
 
 @pytest.mark.parametrize("why", ["no size export", "threshold compaction off", "a ! window", "no size reported yet",
-                                 "msgs it can't read", "a = window before its handoff",
-                                 "a = window after another session's handoff"])
+                                 "msgs it can't read"])
 def test_where_the_daemon_cannot_compact_afresh_a_stale_fork_is_still_resumed(rig, why):
     if why == "threshold compaction off":
         (rig.home / ".claude" / "precompact.conf").write_text("auto_compact_at=0\nauto_resume=1\n")
-    window = "gloss!" if why == "a ! window" else "gloss=" if why.startswith("a = window") else "gloss"
+    window = "gloss!" if why == "a ! window" else "gloss"
     rig.start(window, 0 if why == "no size reported yet" else 100000,
               daemon=False, ctx=why not in ("no size export", "msgs it can't read"))
     if why == "msgs it can't read":
         rig.signal("ctx").write_text(f"{rig.target}\t100000\t100k\n")
-    if why == "a = window after another session's handoff":
+    rig.fork("stale-fork", age=5)
+    rig.start_daemon()
+    rig.wait_for("TYPED /resume stale-fork")
+
+
+@pytest.mark.parametrize("handoff", ["none", "another session's"])
+def test_in_an_equals_window_a_stale_fork_is_dropped_and_a_pane_under_its_threshold_left_alone(rig, handoff):
+    rig.start("gloss=", 100000, daemon=False)
+    if handoff == "another session's":
         now = int(time.time())
         rig.signal("handoff").write_text(f"done\t{uuid.uuid4()}\tp1\t{now - 1000}\t{now - 990}\n")
     rig.fork("stale-fork", age=5)
     rig.start_daemon()
-    rig.wait_for("TYPED /resume stale-fork")
+    end = time.time() + 10
+    while "resume-stale" not in rig.daemon_log() and time.time() < end:
+        time.sleep(0.2)
+    time.sleep(2)
+    assert "resume-stale" in rig.daemon_log()
+    assert rig.typed() == []
+
+
+def test_in_an_equals_window_over_its_threshold_a_stale_fork_is_handed_off_afresh(rig):
+    rig.start("gloss=", 600000, daemon=False)
+    rig.fork("stale-fork", age=5)
+    rig.start_daemon()
+    typed = rig.wait_typed(3)
+    assert typed[:2] == ["/compact-handoff", "/compact"] and typed[2].startswith("/resume ")
+    assert "/resume stale-fork" not in typed
 
 
 def test_a_resume_the_session_swallowed_is_not_resent_after_the_turn_it_ran(rig):
@@ -305,7 +341,7 @@ def test_the_daemon_keeps_a_heartbeat_only_while_it_runs(rig):
 
 
 def test_in_an_equals_window_a_fork_from_before_a_handoff_is_compacted_afresh_after_it(rig):
-    rig.start("gloss=", 100000, daemon=False)
+    rig.start("gloss=", 600000, daemon=False)
     rig.fork("pre-handoff-fork", age=5)
     rig.keys("/compact-handoff", "Enter")
     rig.wait_for("IDLE")
@@ -352,11 +388,13 @@ def test_a_fork_written_while_the_daemon_holds_an_older_one_is_not_overwritten(r
     assert rig.typed() == ["work", "/resume new-fork"]
 
 
-def test_in_an_equals_window_a_fork_a_turn_outlived_after_its_handoff_is_compacted_afresh(rig):
-    rig.start("gloss=", 600000, resume="eat,ok")
-    typed = rig.wait_typed(5)
+@pytest.mark.parametrize("old_hooks", [False, True])
+def test_in_an_equals_window_a_fork_a_turn_outlived_after_its_handoff_is_handed_off_afresh(rig, old_hooks):
+    rig.start("gloss=", 600000, resume="eat,ok", old_hooks=old_hooks)
+    typed = rig.wait_typed(6)
     resumes = [t for t in typed if t.startswith("/resume ")]
-    assert typed[:5] == ["/compact-handoff", "/compact", resumes[0], "/compact", resumes[1]] and resumes[0] != resumes[1]
+    assert typed[:6] == ["/compact-handoff", "/compact", resumes[0], "/compact-handoff", "/compact", resumes[1]]
+    assert resumes[0] != resumes[1]
     assert "resume-stale" in rig.daemon_log()
 
 
