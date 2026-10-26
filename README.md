@@ -58,7 +58,7 @@ The current session is **untouched** (the hook blocks but doesn't rewrite it in 
 
 `/resume` is built in: it swaps your current chat for another session in the same terminal (no `/exit` + relaunch). No id handy? Run `/resume` with no argument and pick the newest **`compact …`** entry — every fork is titled `compact MM-DD HH:MM`. A fresh-shell `claude --resume` opens the same picker.
 
-You're now in the forked session with head + summary + tail loaded. The original is preserved on disk in case you want to go back.
+You're now in the forked session with head + summary + tail loaded. The original is preserved on disk in case you want to go back. The original's subagents come along, so you can still message one that had already finished.
 
 > Tip: a human-readable preview of every fork is also written to `<project>/.claude/summaries/<sid>-<ts>.md` so you can inspect what the summarizer produced before resuming.
 

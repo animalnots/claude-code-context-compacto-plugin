@@ -13,10 +13,11 @@ where state is running, done, aborted or failed. Inside tmux the key is the pane
 daemon's .ctx and .resume files. Outside tmux it is "s_<session id>", and the file is dropped
 once the turn is over, since only the guard reads it there.
 
-Every Stop of a session that keeps a transcript also writes the session id to <key>.hooked. The
-daemon types the handoff command only into panes that have one, because a session started before
-this plugin version runs no such hooks, and after a handoff that never started it waits for a
-newer one.
+Every Stop of a session that keeps a transcript also writes the session id to <key>.hooked, and the
+prompt_id of the turn that ended on a second line. The daemon types the handoff command only into
+panes that have one, because a session started before this plugin version runs no such hooks, and
+after a handoff that never started it waits for a newer one. When the second line names another turn
+than the handoff's, a turn ran after the handoff, so the daemon hands off again before compacting.
 
 Config (~/.claude/precompact.conf): handoff_command=<skill or command> (default compact-handoff).
 The hook prints nothing and always exits 0, so it can't disturb a turn.
@@ -181,7 +182,7 @@ def main():
     # this pane's TMUX_PANE; only a Stop whose transcript is on disk comes from the pane's own Claude.
     transcript = payload.get("transcript_path")
     if event == "Stop" and pane_key() and isinstance(transcript, str) and os.path.isfile(transcript):
-        _write(signal_dir() / f"{key}.hooked", session + "\n")
+        _write(signal_dir() / f"{key}.hooked", session + "\n" + (prompt + "\n" if prompt else ""))
     st = read_state(key)
     if not (prompt and st and st["state"] == "running" and st["session"] == session):
         return

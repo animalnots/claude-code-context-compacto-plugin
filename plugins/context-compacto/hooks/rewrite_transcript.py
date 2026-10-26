@@ -27,6 +27,7 @@ Both can be overridden via env:
 """
 import json
 import os
+import shutil
 import uuid
 import datetime
 from typing import List, Dict, Optional, Tuple, Callable
@@ -601,6 +602,39 @@ def rewrite(orig_path: str, summary: str, projects_dir: str = None) -> str:
             f.write(json.dumps(e) + "\n")
 
     return new_id
+
+
+def carry_subagents(orig_path: str, new_id: str, projects_dir: str = None) -> int:
+    """Puts the original session's subagents/ files under <projects_dir>/<new_id>/subagents/, keeping any
+    already there, and returns how many it added.
+
+    Claude Code looks a subagent up to resume it only under the current session's folder. Transcripts are
+    hard-linked, because Claude Code appends to the one at the current session's path, so a subagent still
+    running keeps a single history; other files, and transcripts that can't be linked, are copied.
+    """
+    if projects_dir is None:
+        projects_dir = os.path.dirname(orig_path)
+    src = os.path.join(os.path.splitext(orig_path)[0], "subagents")
+    dst = os.path.join(projects_dir, new_id, "subagents")
+    carried = 0
+    for root, _, files in os.walk(src):
+        out = os.path.join(dst, os.path.relpath(root, src))
+        for name in files:
+            target = os.path.join(out, name)
+            if os.path.lexists(target):
+                continue
+            os.makedirs(out, exist_ok=True)
+            source = os.path.join(root, name)
+            if name.endswith(".jsonl"):
+                try:
+                    os.link(source, target)
+                    carried += 1
+                    continue
+                except OSError:
+                    pass
+            shutil.copy2(source, target)
+            carried += 1
+    return carried
 
 
 if __name__ == "__main__":

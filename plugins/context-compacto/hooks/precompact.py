@@ -5,7 +5,8 @@ Reads PreCompact JSON payload on stdin, blocks the native compaction, and
 produces:
   - a markdown preview at <project>/.claude/summaries/<sid>-<ts>.md
   - a compressed fork transcript at <projects-dir>/<new-sid>.jsonl that
-    Claude Code can resume via `claude --resume <new-sid>`.
+    Claude Code can resume via `claude --resume <new-sid>`, with the session's
+    subagent transcripts linked under <projects-dir>/<new-sid>/subagents/.
 
 Compactions inside a subagent pass through to Claude Code's native compaction.
 They are recognised by `agent_id` in the payload. Claude Code 2.1.300 and later
@@ -14,7 +15,7 @@ holds. The cutoff is 85% of CLAUDE_CODE_AUTO_COMPACT_WINDOW or 60k tokens short
 of it, whichever is lower; without that variable neither rule applies.
   - The parent's context is under the cutoff.
   - The transcript written last, among the parent's and its subagents', is a
-    subagent's, from the last 60 s, with a context at or over the cutoff, and the
+    subagent's, from the last 3 s, with a context at or over the cutoff, and the
     parent's hasn't changed for 5 s. It's checked after a 0.5 s wait, which lets
     the transcript writes Claude Code still has pending land.
 Both rules run before the "!", "=" and handoff rules below, so subagents compact
@@ -269,12 +270,19 @@ def _subagent_facts(parent_path):
     return facts
 
 
+# A compacting subagent writes the entry that sets its compaction off just before the hook runs: 0.3-1.1 s
+# by the settled check in compactions.log. A subagent last written 6 s before was mid-request while the main
+# session compacted, which looked still only because Claude Code hadn't written its newest entries yet.
+SUBAGENT_FRESH_SECS = 3
+
+
 def _subagent_compacting(f, cutoff, settled=True):
     # A compaction follows an entry its context has just made, which Claude Code writes about 0.1 s
     # later: a main session written in the last few seconds may be the one compacting, and until the
     # writes have settled, the compacting subagent's transcript may not look like the newest yet.
     return (f["subagent"] is not None and f["parent_age"] >= 5 and f["subagent_ctx"] >= cutoff
-            and (not settled or (f["subagent_age"] < f["parent_age"] and f["subagent_age"] <= 60)))
+            and (not settled or (f["subagent_age"] < f["parent_age"]
+                                 and f["subagent_age"] <= SUBAGENT_FRESH_SECS)))
 
 
 def _auto_compact_trigger_tokens():
@@ -716,11 +724,17 @@ with preview.open("w", encoding="utf-8") as f:
 # ---- 9. Write fork via rewrite_transcript --------------------------------
 fork_id = None
 fork_error = None
+carry_error = None
 if summary and rewrite_transcript is not None:
     try:
         fork_id = rewrite_transcript.rewrite(transcript_path, summary)
     except Exception as e:
         fork_error = f"{type(e).__name__}: {e}"
+    if fork_id:
+        try:
+            rewrite_transcript.carry_subagents(transcript_path, fork_id)
+        except Exception as e:
+            carry_error = f"{type(e).__name__}: {e}"
 elif summary is None:
     fork_error = "no summary, fork skipped"
 
@@ -766,6 +780,9 @@ if fork_id:
     reason_parts.append(f"Compressed fork written. Resume in this chat with:  /resume {fork_id}   (or  claude --resume {fork_id}  from a new shell).")
 elif fork_error:
     reason_parts.append(f"Fork not created: {fork_error}")
+if carry_error:
+    reason_parts.append(f"Subagent transcripts not carried into the fork ({carry_error}), "
+                        "so a finished subagent can't be messaged after the /resume.")
 if autoresume_note:
     reason_parts.append(autoresume_note)
 if summary_error:
