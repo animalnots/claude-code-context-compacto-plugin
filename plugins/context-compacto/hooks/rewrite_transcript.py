@@ -606,7 +606,8 @@ def rewrite(orig_path: str, summary: str, projects_dir: str = None) -> str:
 
 def carry_subagents(orig_path: str, new_id: str, projects_dir: str = None) -> int:
     """Puts the original session's subagents/ files under <projects_dir>/<new_id>/subagents/, keeping any
-    already there, and returns how many it added.
+    already there, and returns how many it added. A file it can't carry doesn't stop the rest: once all
+    were tried, it raises OSError naming up to three of those it left behind.
 
     Claude Code looks a subagent up to resume it only under the current session's folder. Transcripts are
     hard-linked, because Claude Code appends to the one at the current session's path, so a subagent still
@@ -616,24 +617,30 @@ def carry_subagents(orig_path: str, new_id: str, projects_dir: str = None) -> in
         projects_dir = os.path.dirname(orig_path)
     src = os.path.join(os.path.splitext(orig_path)[0], "subagents")
     dst = os.path.join(projects_dir, new_id, "subagents")
-    carried = 0
+    carried, failed = 0, []
     for root, _, files in os.walk(src):
         out = os.path.join(dst, os.path.relpath(root, src))
         for name in files:
             target = os.path.join(out, name)
             if os.path.lexists(target):
                 continue
-            os.makedirs(out, exist_ok=True)
             source = os.path.join(root, name)
-            if name.endswith(".jsonl"):
-                try:
-                    os.link(source, target)
-                    carried += 1
-                    continue
-                except OSError:
-                    pass
-            shutil.copy2(source, target)
-            carried += 1
+            try:
+                os.makedirs(out, exist_ok=True)
+                if name.endswith(".jsonl"):
+                    try:
+                        os.link(source, target)
+                        carried += 1
+                        continue
+                    except OSError:
+                        pass
+                shutil.copy2(source, target)
+                carried += 1
+            except OSError as e:
+                failed.append(f"{os.path.relpath(source, src)} ({e.strerror or e})")
+    if failed:
+        shown = ", ".join(failed[:3]) + (", …" if len(failed) > 3 else "")
+        raise OSError(f"{len(failed)} of {carried + len(failed)} files failed: {shown}")
     return carried
 
 

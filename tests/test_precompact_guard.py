@@ -211,8 +211,6 @@ def test_a_subagent_quiet_for_over_a_minute_is_not_the_one_compacting(big):
 
 
 def test_a_subagent_last_written_seconds_before_the_compaction_is_not_the_one_compacting(big):
-    # Claude Code can hold the main session's newest entries back while its own compaction starts,
-    # so the main session looks still while a subagent wrote a few seconds before.
     big.parent(CUTOFF + 15000, age=9)
     big.subagent(CUTOFF + 30000, age=6)
     assert PASSED in big.decide()
@@ -372,7 +370,8 @@ def test_a_fork_whose_subagent_files_cannot_be_carried_is_still_written(forking,
     finally:
         meta.chmod(0o644)
     assert re.search(r"/resume \S+", reason)
-    assert "Subagent transcripts not carried into the fork (PermissionError" in reason
+    assert ("Subagent transcripts not carried into the fork (OSError: 1 of 2 files failed: "
+            "agent-a1b2c3d4e5f6a7b8c.meta.json (Permission denied))") in reason
 
 
 def test_a_subagent_write_that_lands_while_the_hook_decides_is_seen(big, tmp_path):
