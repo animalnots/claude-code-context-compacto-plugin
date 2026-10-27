@@ -270,7 +270,7 @@ def _subagent_facts(parent_path):
     return facts
 
 
-# A compacting subagent writes the entry that sets its compaction off just before the hook runs: 0.3-1.1 s
+# A compacting subagent writes the entry that sets its compaction off just before the hook runs: 0.3-1.8 s
 # by the settled check in compactions.log. A subagent last written 6 s before was mid-request while the main
 # session compacted, which looked still only because Claude Code hadn't written its newest entries yet.
 SUBAGENT_FRESH_SECS = 3

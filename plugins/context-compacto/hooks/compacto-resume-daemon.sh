@@ -184,8 +184,10 @@ function classify(    first, i, s, busy, box, footer, bg) {
     # Only a finished turn's status line means idle: "✻ Sautéed for 5m 51s · done 1:11" or
     # "✻ Waiting for 6 background agents to finish". A turn in progress is worded many ways, e.g.
     # "(Checking UI changes… · 30m 43s" or "Waiting for API response · will retry in 2m 40s".
+    # Once background agents that outlasted turns finish, the next finished line times the whole stretch
+    # from the first turn that left them running, so it can read "for 1d 1h 7m".
     for (i = box - 1; i >= 1; i--) if (line[i] ~ /^(·|✢|✳|✶|✻|✽|\*) /) break
-    if (i >= 1 && line[i] !~ /^[^ ]+ [^ ]+ for [0-9]+[hms]/ && line[i] !~ /^[^ ]+ Waiting for [0-9]+ background agents? to finish/) return "busy"
+    if (i >= 1 && line[i] !~ /^[^ ]+ [^ ]+ for [0-9]+[dhms]/ && line[i] !~ /^[^ ]+ Waiting for [0-9]+ background agents? to finish/) return "busy"
     # Claude wakes itself when background work finishes, so the box is not "done" while a
     # "✻ Waiting for 6 background agents to finish" or "… · 1 shell still running" line sits
     # above it or the footer under it shows "· 1 shell ·". Messages and prompts can quote those.

@@ -1,5 +1,6 @@
 import os
 import pathlib
+import shlex
 import subprocess
 import sys
 import time
@@ -35,13 +36,14 @@ class Rig:
         self.target = None
 
     def start(self, window, msgs, handoff="ok", hooked=True, draft="", daemon=True, resume="ok", ctx=True,
-              compact="ok", old_hooks=False):
+              compact="ok", old_hooks=False, done_for="3s"):
         cmd = [sys.executable, str(FAKE), "--log", str(self.log), "--transcript", str(self.transcript),
-               "--msgs", str(msgs), "--handoff", handoff, "--resume", resume, "--compact", compact] \
+               "--msgs", str(msgs), "--handoff", handoff, "--resume", resume, "--compact", compact,
+               "--done-for", done_for] \
             + (["--hooked"] if hooked else []) + ([] if ctx else ["--no-ctx"]) \
             + (["--old-hooks"] if old_hooks else [])
         subprocess.run(self.tmux + ["new-session", "-d", "-s", "t", "-n", window, "-x", "120", "-y", "30",
-                                    " ".join(cmd)], env=self.env, check=True)
+                                    shlex.join(cmd)], env=self.env, check=True)
         self.target = subprocess.run(self.tmux + ["display-message", "-p", "-t", "t", "#{pane_id}"],
                                      capture_output=True, text=True, check=True).stdout.strip()
         self.wait_for("READY")
@@ -203,6 +205,13 @@ def test_plain_window_still_compacts_at_the_threshold(rig):
     rig.start("gloss", 300000)
     rig.wait_for("COMPACTED")
     assert rig.typed()[0] == "/compact"
+
+
+@pytest.mark.parametrize("window,msgs,first", [("gloss=", 600000, "/compact-handoff"), ("gloss", 300000, "/compact")])
+def test_a_finished_turn_timed_in_days_counts_as_idle(rig, window, msgs, first):
+    rig.start(window, msgs, done_for="1d 1h 7m")
+    rig.wait_for("COMPACTED")
+    assert rig.typed()[0] == first
 
 
 def test_bang_wins_over_equals(rig):
