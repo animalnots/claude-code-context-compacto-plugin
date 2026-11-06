@@ -39,7 +39,7 @@ class Rig:
                         COMPACTO_COMPACT_COOLDOWN="60", COMPACTO_HANDOFF_START_TIMEOUT="3")
         self.daemon = None
         self.target = None
-        self.client = None
+        self.clients = []
 
     def start(self, window, msgs, handoff="ok", hooked=True, draft="", daemon=True, resume="ok", ctx=True,
               compact="ok", old_hooks=False, done_for="3s", dialog=False):
@@ -65,8 +65,8 @@ class Rig:
     def keys(self, *keys):
         subprocess.run(self.tmux + ["send-keys", "-t", self.target, *keys], check=True)
 
-    def pane(self, fmt):
-        return subprocess.run(self.tmux + ["display-message", "-p", "-t", self.target, fmt],
+    def pane(self, fmt, target=None):
+        return subprocess.run(self.tmux + ["display-message", "-p", "-t", target or self.target, fmt],
                               capture_output=True, text=True, check=True).stdout.strip()
 
     def scroll(self):
@@ -77,19 +77,19 @@ class Rig:
     def scrolled(self):
         return self.pane("#{pane_in_mode}") == "1"
 
-    def attach(self):
+    def attach(self, session="t"):
         """A client showing the session, so its current window counts as viewed."""
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 31, 120, 0, 0))
-        self.client = subprocess.Popen(self.tmux + ["attach-session", "-t", "t"], stdin=slave, stdout=slave,
-                                       stderr=slave, env={**self.env, "TERM": "xterm-256color"},
-                                       start_new_session=True)
+        self.clients.append(subprocess.Popen(self.tmux + ["attach-session", "-t", session], stdin=slave, stdout=slave,
+                                             stderr=slave, env={**self.env, "TERM": "xterm-256color"},
+                                             start_new_session=True))
         os.close(slave)
         threading.Thread(target=self._drain, args=(master,), daemon=True).start()
         end = time.time() + 10
-        while self.pane("#{session_attached}") != "1" and time.time() < end:
+        while self.pane("#{session_attached}", session) != "1" and time.time() < end:
             time.sleep(0.05)
-        assert self.pane("#{session_attached}") == "1"
+        assert self.pane("#{session_attached}", session) == "1"
 
     @staticmethod
     def _drain(fd):
@@ -101,11 +101,17 @@ class Rig:
         os.close(fd)
 
     def other_window(self):
-        """Opens a second window and leaves the pane's window on screen."""
         subprocess.run(self.tmux + ["new-window", "-d", "-t", "t:9", "cat"], env=self.env, check=True)
 
     def show_other_window(self):
         subprocess.run(self.tmux + ["select-window", "-t", "t:9"], check=True)
+
+    def tmux_without(self, fmt):
+        """Renames fmt in the daemon's tmux commands to one tmux doesn't know, so the real server prints nothing for it."""
+        shim = self.home / "tmux-without"
+        shim.write_text(f'#!/bin/bash\nexec {shlex.join(self.tmux)} "${{@//{fmt}/not_a_format}}"\n')
+        shim.chmod(0o755)
+        self.env["COMPACTO_TMUX"] = str(shim)
 
     def watch_markers(self):
         """Turns markers on: they need a format that prints @cc_state, and the fake's name to count as Claude."""
@@ -166,8 +172,8 @@ class Rig:
             self.daemon.terminate()
             self.daemon.wait(timeout=10)
         subprocess.run(self.tmux + ["kill-server"], capture_output=True)
-        if self.client:
-            self.client.wait(timeout=10)
+        for client in self.clients:
+            client.wait(timeout=10)
 
 
 @pytest.fixture
@@ -572,6 +578,91 @@ def test_a_mode_that_copy_commands_cannot_leave_is_held_and_logged_once(rig):
     assert rig.scrolled() and rig.typed() == []
     log = rig.daemon_log()
     assert log.count("handoff-scrolled") == 1 and "unscrolled" not in log
+
+
+def test_a_chooser_opened_over_the_scrolled_window_on_screen_keeps_its_marker_and_gets_no_keys(rig):
+    rig.start("gloss=", 600000, daemon=False)
+    rig.watch_markers()
+    rig.attach()
+    rig.scroll()
+    rig.start_daemon()
+    rig.wait_marker("^")
+    subprocess.run(rig.tmux + ["choose-tree", "-t", rig.target], check=True)
+    assert rig.pane("#{pane_in_mode}") == "2"
+    time.sleep(3)
+    assert rig.pane("#{pane_in_mode} #{pane_mode} #{@cc_state}") == "2 tree-mode ^"
+    assert rig.typed() == []
+    log = rig.daemon_log()
+    assert log.count("handoff-scrolled") == 1 and "handoff-not-typed" not in log
+
+
+def test_a_chooser_over_a_scrolled_window_nobody_is_viewing_is_held_too(rig):
+    rig.start("gloss=", 600000, daemon=False)
+    rig.watch_markers()
+    rig.scroll()
+    subprocess.run(rig.tmux + ["choose-tree", "-t", rig.target], check=True)
+    rig.start_daemon()
+    rig.wait_marker("^")
+    time.sleep(2)
+    assert rig.pane("#{pane_in_mode} #{pane_mode}") == "2 tree-mode" and rig.typed() == []
+    log = rig.daemon_log()
+    assert log.count("handoff-scrolled") == 1 and "unscrolled" not in log and "handoff-not-typed" not in log
+
+
+def test_a_chooser_over_a_scrolled_plain_window_gets_no_compact(rig):
+    rig.start("gloss", 600000, daemon=False)
+    rig.scroll()
+    subprocess.run(rig.tmux + ["choose-tree", "-t", rig.target], check=True)
+    rig.start_daemon()
+    time.sleep(3)
+    assert rig.pane("#{pane_in_mode} #{pane_mode}") == "2 tree-mode" and rig.typed() == []
+    assert "fire" not in rig.daemon_log() and not rig.signal("compacting").exists()
+
+
+def start_daemon_and_expect_held(rig):
+    rig.watch_markers()
+    rig.start_daemon()
+    rig.wait_marker("^")
+    time.sleep(2)
+    assert rig.scrolled() and rig.typed() == []
+    log = rig.daemon_log()
+    assert log.count("handoff-scrolled") == 1 and "unscrolled" not in log
+
+
+def test_a_window_on_screen_also_linked_into_a_detached_session_keeps_its_scroll(rig):
+    rig.start("gloss=", 600000, daemon=False)
+    rig.attach()
+    subprocess.run(rig.tmux + ["new-session", "-d", "-s", "other", "cat"], env=rig.env, check=True)
+    subprocess.run(rig.tmux + ["link-window", "-s", "t:0", "-t", "other:5"], check=True)
+    rig.scroll()
+    assert rig.pane("#{session_name} #{window_active} #{session_attached}") == "other 1 0"
+    start_daemon_and_expect_held(rig)
+
+
+def test_a_window_on_screen_in_one_session_of_a_group_keeps_its_scroll(rig):
+    rig.start("gloss=", 600000, daemon=False)
+    rig.other_window()
+    subprocess.run(rig.tmux + ["new-session", "-d", "-s", "t2", "-t", "t"], env=rig.env, check=True)
+    subprocess.run(rig.tmux + ["select-window", "-t", "t2:9"], check=True)
+    rig.attach()
+    rig.attach("t2")
+    rig.scroll()
+    assert rig.pane("#{session_name} #{window_active} #{session_attached}") == "t2 0 1"
+    start_daemon_and_expect_held(rig)
+
+
+def test_a_tmux_that_cannot_count_viewers_holds_a_scrolled_pane(rig):
+    rig.start("gloss=", 600000, daemon=False)
+    rig.tmux_without("window_active_clients")
+    rig.scroll()
+    start_daemon_and_expect_held(rig)
+
+
+def test_a_tmux_that_cannot_report_modes_still_gets_its_compact(rig):
+    rig.start("gloss", 300000, daemon=False)
+    rig.tmux_without("pane_in_mode")
+    rig.start_daemon()
+    rig.wait_for("TYPED /compact")
 
 
 def test_the_marker_goes_when_the_window_loses_its_equals(rig):

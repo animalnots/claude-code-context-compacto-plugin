@@ -220,7 +220,8 @@ pane_idle() {
     # Keys sent to a copy-mode pane are eaten by copy-mode (/ starts a search), so
     # /compact and /resume never land. Treat any pane the user is scrolling as not-ready:
     # don't type into it, and retry once they exit.
-    [ "$($TMUX_CMD display-message -p -t "$1" '#{pane_in_mode}' 2>/dev/null)" = 1 ] && return 1
+    # pane_in_mode counts modes, so a chooser over a scroll reads 2. Empty, where it's unsupported, isn't a mode.
+    case "$($TMUX_CMD display-message -p -t "$1" '#{pane_in_mode}' 2>/dev/null)" in [1-9]*) return 1 ;; esac
     pane_at_rest "$1"
 }
 pane_pending_compact() {
@@ -300,7 +301,6 @@ PANE_STATE=(); PANE_UNSEEN=(); PANE_READ_AT=(); PANE_CONTINUED=(); PANE_QUIET=()
 HANDOFF_REDO=()
 # "=" panes a scroll is holding back this poll, and those whose scroll is already in events.log.
 HANDOFF_HELD=(); HANDOFF_SCROLL_LOGGED=()
-window_viewed() { [ "$1" = 1 ] && [ "${2:-0}" -gt 0 ]; }    # window_active, session_attached
 # The daemon's own handoff -> /compact -> /resume cycle is housekeeping, not a finished turn,
 # until it types a continue that sets Claude working again.
 compaction_in_flight() {
@@ -323,7 +323,7 @@ update_markers() {
             continue
         fi
         claude="$claude $n"; pane_win[$n]="$w"
-        pane_viewed[$n]=0; window_viewed "$wactive" "$attached" && pane_viewed[$n]=1
+        pane_viewed[$n]=0; [ "$wactive" = 1 ] && [ "${attached:-0}" -gt 0 ] && pane_viewed[$n]=1
         # Re-read only panes that printed something since the last read (>= so output in the
         # same second as that read still gets one more read). Keep the last state while scrolling.
         if [ "$inmode" != 1 ] && { [ -z "${PANE_STATE[$n]:-}" ] || [ "${activity:-0}" -ge "${PANE_READ_AT[$n]:-0}" ]; }; then
@@ -393,12 +393,13 @@ markers_wanted() {
 # A window on screen keeps its scroll, because someone is reading it.
 # capture-pane reads the live screen, not the scrolled view, so the checks below work on a scrolled pane.
 unscroll_for_handoff() {
-    local n="${cpane#%}" inmode active attached
+    local n="${cpane#%}" inmode viewers
     [ "$ON_PSMUX" = 1 ] && return 0                 # its copy-mode commands are untested
-    read -r inmode active attached <<<"$($TMUX_CMD display-message -p -t "$ctgt" '#{pane_in_mode} #{window_active} #{session_attached}' 2>/dev/null)"
-    if [ "${inmode:-0}" != 1 ]; then unset "HANDOFF_SCROLL_LOGGED[$n]"; return 0; fi
+    read -r inmode viewers <<<"$($TMUX_CMD display-message -p -t "$ctgt" '#{pane_in_mode} #{window_active_clients}' 2>/dev/null)"
+    if [ "${inmode:-0}" = 0 ]; then unset "HANDOFF_SCROLL_LOGGED[$n]"; return 0; fi
     # Other modes (choose-tree, say) read as in_mode too, and refuse a copy-mode command.
-    if ! window_viewed "$active" "$attached" && pane_at_rest "$ctgt" && pane_box_empty "$ctgt" \
+    # tmux before 3.1 prints no window_active_clients, so only a real 0 may mean nobody is looking.
+    if [ "$viewers" = 0 ] && pane_at_rest "$ctgt" && pane_box_empty "$ctgt" \
         && $TMUX_CMD send-keys -t "$ctgt" -X cancel 2>/dev/null; then
         evlog "handoff-unscrolled $ctgt $METRIC=$val"
         return 0
