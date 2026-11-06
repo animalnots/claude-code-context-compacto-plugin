@@ -35,6 +35,7 @@ ap.add_argument("--hooked", action="store_true", help="this session runs the plu
 ap.add_argument("--old-hooks", action="store_true", help="its Stop hook stamps the session but not the turn")
 ap.add_argument("--no-ctx", action="store_true", help="this session's statusline doesn't export its size")
 ap.add_argument("--done-for", default="3s", help="how long the finished turn's status line says it took")
+ap.add_argument("--dialog", action="store_true", help="a question dialog stands where the input box would be")
 args = ap.parse_args()
 
 pane = os.environ["TMUX_PANE"]
@@ -56,8 +57,8 @@ def log(event):
 
 def render(busy):
     status = "✳ Working… (3s · ↓ 1.2k tokens)" if busy else f"✻ Worked for {args.done_for} · done 11:09"
-    sys.stdout.write("\033[2J\033[H⏺ fake claude\n" + "".join(h + "\n" for h in history) + "\n" + status + "\n"
-                     + "─" * 40 + "\n❯\u00a0")
+    box = "Proceed?\n❯ 1. Yes\n  2. No\n\nEsc to cancel\n" if args.dialog else "─" * 40 + "\n❯\u00a0"
+    sys.stdout.write("\033[2J\033[H⏺ fake claude\n" + "".join(h + "\n" for h in history) + "\n" + status + "\n" + box)
     sys.stdout.flush()
     if not args.no_ctx:
         (signals / f"{key}.ctx").write_text(f"{pane}\t{msgs}\t{msgs}\n")

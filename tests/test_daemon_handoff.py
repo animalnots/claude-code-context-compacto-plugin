@@ -1,8 +1,13 @@
+import fcntl
 import os
 import pathlib
+import pty
 import shlex
+import struct
 import subprocess
 import sys
+import termios
+import threading
 import time
 import uuid
 
@@ -34,14 +39,15 @@ class Rig:
                         COMPACTO_COMPACT_COOLDOWN="60", COMPACTO_HANDOFF_START_TIMEOUT="3")
         self.daemon = None
         self.target = None
+        self.client = None
 
     def start(self, window, msgs, handoff="ok", hooked=True, draft="", daemon=True, resume="ok", ctx=True,
-              compact="ok", old_hooks=False, done_for="3s"):
+              compact="ok", old_hooks=False, done_for="3s", dialog=False):
         cmd = [sys.executable, str(FAKE), "--log", str(self.log), "--transcript", str(self.transcript),
                "--msgs", str(msgs), "--handoff", handoff, "--resume", resume, "--compact", compact,
                "--done-for", done_for] \
             + (["--hooked"] if hooked else []) + ([] if ctx else ["--no-ctx"]) \
-            + (["--old-hooks"] if old_hooks else [])
+            + (["--old-hooks"] if old_hooks else []) + (["--dialog"] if dialog else [])
         subprocess.run(self.tmux + ["new-session", "-d", "-s", "t", "-n", window, "-x", "120", "-y", "30",
                                     shlex.join(cmd)], env=self.env, check=True)
         self.target = subprocess.run(self.tmux + ["display-message", "-p", "-t", "t", "#{pane_id}"],
@@ -58,6 +64,59 @@ class Rig:
 
     def keys(self, *keys):
         subprocess.run(self.tmux + ["send-keys", "-t", self.target, *keys], check=True)
+
+    def pane(self, fmt):
+        return subprocess.run(self.tmux + ["display-message", "-p", "-t", self.target, fmt],
+                              capture_output=True, text=True, check=True).stdout.strip()
+
+    def scroll(self):
+        """Scrolls the pane up as the wheel does, which puts it in copy-mode."""
+        subprocess.run(self.tmux + ["copy-mode", "-e", "-t", self.target], check=True)
+        self.keys("-X", "-N", "5", "scroll-up")
+
+    def scrolled(self):
+        return self.pane("#{pane_in_mode}") == "1"
+
+    def attach(self):
+        """A client showing the session, so its current window counts as viewed."""
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 31, 120, 0, 0))
+        self.client = subprocess.Popen(self.tmux + ["attach-session", "-t", "t"], stdin=slave, stdout=slave,
+                                       stderr=slave, env={**self.env, "TERM": "xterm-256color"},
+                                       start_new_session=True)
+        os.close(slave)
+        threading.Thread(target=self._drain, args=(master,), daemon=True).start()
+        end = time.time() + 10
+        while self.pane("#{session_attached}") != "1" and time.time() < end:
+            time.sleep(0.05)
+        assert self.pane("#{session_attached}") == "1"
+
+    @staticmethod
+    def _drain(fd):
+        try:
+            while os.read(fd, 65536):
+                pass
+        except OSError:
+            pass
+        os.close(fd)
+
+    def other_window(self):
+        """Opens a second window and leaves the pane's window on screen."""
+        subprocess.run(self.tmux + ["new-window", "-d", "-t", "t:9", "cat"], env=self.env, check=True)
+
+    def show_other_window(self):
+        subprocess.run(self.tmux + ["select-window", "-t", "t:9"], check=True)
+
+    def watch_markers(self):
+        """Turns markers on: they need a format that prints @cc_state, and the fake's name to count as Claude."""
+        self.env["COMPACTO_CLAUDE_CMD_REGEX"] = "."
+        subprocess.run(self.tmux + ["set-option", "-g", "window-status-format", "#{@cc_state}#W"], check=True)
+
+    def wait_marker(self, mark, timeout=10):
+        end = time.time() + timeout
+        while self.pane("#{@cc_state}") != mark and time.time() < end:
+            time.sleep(0.05)
+        assert self.pane("#{@cc_state}") == mark
 
     def events(self):
         if not self.log.exists():
@@ -107,6 +166,8 @@ class Rig:
             self.daemon.terminate()
             self.daemon.wait(timeout=10)
         subprocess.run(self.tmux + ["kill-server"], capture_output=True)
+        if self.client:
+            self.client.wait(timeout=10)
 
 
 @pytest.fixture
@@ -415,3 +476,136 @@ def test_a_draft_in_the_input_box_holds_a_left_compaction(rig):
     assert rig.typed() == []
     rig.keys(*["BSpace"] * 5)
     rig.wait_for("TYPED /compact")
+
+
+@pytest.mark.parametrize("client", [False, True], ids=["nobody attached", "another window on screen"])
+def test_a_scrolled_pane_nobody_is_viewing_is_scrolled_back_and_handed_off(rig, client):
+    rig.start("gloss=", 600000, daemon=False)
+    if client:
+        rig.other_window()
+        rig.attach()
+        rig.show_other_window()
+    rig.scroll()
+    rig.start_daemon()
+    rig.wait_for("TYPED /compact-handoff")
+    assert not rig.scrolled()
+    assert "unscrolled" in rig.daemon_log()
+
+
+def test_the_window_on_screen_stays_scrolled_with_a_marker_and_hands_off_once_scrolled_back(rig):
+    rig.start("gloss=", 600000, daemon=False)
+    rig.watch_markers()
+    rig.attach()
+    rig.scroll()
+    rig.start_daemon()
+    rig.wait_marker("^")
+    time.sleep(2)
+    assert rig.scrolled() and rig.typed() == []
+    assert rig.daemon_log().count("handoff-scrolled") == 1
+    rig.keys("-X", "cancel")
+    rig.wait_for("TYPED /compact-handoff")
+    rig.wait_marker("")
+    assert "unscrolled" not in rig.daemon_log()
+
+
+def test_leaving_a_scrolled_window_lets_its_handoff_run(rig):
+    rig.start("gloss=", 600000, daemon=False)
+    rig.other_window()
+    rig.attach()
+    rig.scroll()
+    rig.start_daemon()
+    time.sleep(2)
+    assert rig.scrolled() and rig.typed() == []
+    rig.show_other_window()
+    rig.wait_for("TYPED /compact-handoff")
+    assert not rig.scrolled()
+
+
+def test_a_scrolled_pane_keeps_its_place_until_its_turn_ends(rig):
+    rig.start("gloss=", 600000, daemon=False)
+    rig.keys("work", "Enter")
+    rig.wait_for("TYPED work")
+    rig.scroll()
+    assert int(rig.pane("#{scroll_position}")) > 0
+    rig.watch_markers()
+    rig.start_daemon()
+    rig.wait_marker("^")
+    assert rig.scrolled() and rig.typed() == ["work"]
+    rig.wait_for("TYPED /compact-handoff")
+    assert not rig.scrolled()
+
+
+def test_a_scrolled_pane_with_a_draft_keeps_its_place(rig):
+    rig.start("gloss=", 600000, draft="hello", daemon=False)
+    rig.scroll()
+    rig.start_daemon()
+    time.sleep(3)
+    assert rig.scrolled() and rig.typed() == []
+
+
+@pytest.mark.parametrize("window,msgs,hooked", [("gloss", 600000, True), ("gloss!", 600000, True),
+                                                ("gloss=", 300000, True), ("gloss=", 600000, False)],
+                         ids=["plain window", "opted out", "under the threshold", "no hooks"])
+def test_a_pane_the_daemon_would_not_hand_off_keeps_its_place_and_gets_no_marker(rig, window, msgs, hooked):
+    rig.start(window, msgs, hooked=hooked, daemon=False)
+    rig.watch_markers()
+    rig.scroll()
+    rig.start_daemon()
+    time.sleep(3)
+    assert rig.scrolled() and rig.typed() == []
+    assert rig.pane("#{@cc_state}") == ""
+
+
+def test_a_pane_scrolled_during_its_handoff_is_scrolled_back_for_its_compact(rig):
+    rig.start("gloss=", 600000)
+    rig.wait_for("TYPED /compact-handoff")
+    rig.scroll()
+    assert rig.wait_typed(2)[:2] == ["/compact-handoff", "/compact"]
+
+
+def test_a_mode_that_copy_commands_cannot_leave_is_held_and_logged_once(rig):
+    rig.start("gloss=", 600000, daemon=False)
+    subprocess.run(rig.tmux + ["choose-tree", "-t", rig.target], check=True)
+    assert rig.scrolled()
+    rig.start_daemon()
+    time.sleep(2)
+    assert rig.scrolled() and rig.typed() == []
+    log = rig.daemon_log()
+    assert log.count("handoff-scrolled") == 1 and "unscrolled" not in log
+
+
+def test_the_marker_goes_when_the_window_loses_its_equals(rig):
+    rig.start("gloss=", 600000, daemon=False)
+    rig.watch_markers()
+    rig.attach()
+    rig.scroll()
+    rig.start_daemon()
+    rig.wait_marker("^")
+    subprocess.run(rig.tmux + ["rename-window", "-t", rig.target, "gloss"], check=True)
+    rig.wait_marker("")
+    assert rig.scrolled()
+
+
+def test_each_scroll_that_holds_a_handoff_back_is_logged_once(rig):
+    rig.start("gloss=", 600000, draft="hello", daemon=False)
+    rig.attach()
+    rig.scroll()
+    rig.start_daemon()
+    time.sleep(1.5)
+    rig.keys("-X", "cancel")
+    time.sleep(1)
+    rig.scroll()
+    time.sleep(1.5)
+    assert rig.daemon_log().count("handoff-scrolled") == 2
+
+
+def test_a_waiting_dialog_keeps_its_marker_in_a_scrolled_window(rig):
+    rig.start("gloss=", 600000, dialog=True, daemon=False)
+    rig.watch_markers()
+    rig.attach()
+    rig.start_daemon()
+    rig.wait_marker("?")
+    rig.scroll()
+    time.sleep(2)
+    assert "handoff-scrolled" in rig.daemon_log()
+    assert rig.pane("#{@cc_state}") == "?" and rig.typed() == []

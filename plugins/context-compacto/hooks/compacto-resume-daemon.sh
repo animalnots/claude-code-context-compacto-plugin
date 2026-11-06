@@ -31,6 +31,8 @@
 #      types /compact. A handoff that never starts, is cut short or fails is retried on the
 #      /compact back-off below, and never followed by a /compact. One that another turn ended
 #      after (a background result, say) no longer covers the session, so it hands off again.
+#      A pane left scrolled can't take those keys, so once it's at rest this scrolls it back,
+#      unless its window is on screen: that one waits for you and shows "^" (behavior 4).
 #
 #   3. POST-RESUME CONTINUE (resume_continue=<message>): after an auto-triggered
 #      compaction resumes, types <message> (e.g. "continue") so the task keeps
@@ -38,7 +40,8 @@
 #      THIS daemon triggered (behavior 2), never for a manual /compact.
 #
 #   4. WINDOW MARKERS (always; not on psmux): sets the tmux window option @cc_state on windows running
-#      Claude: "?" a question/permission/trust dialog waits for you, "$" Claude finished
+#      Claude: "?" a question/permission/trust dialog waits for you, "^" a "=" window over its
+#      threshold is scrolled up, which holds its handoff back, "$" Claude finished
 #      while you weren't viewing the window, "&" idle but background agents or shells are
 #      still running. Invisible unless window-status-format prints #{@cc_state} (see README).
 #
@@ -207,17 +210,18 @@ function classify(    first, i, s, busy, box, footer, bg) {
 END { print (id != "" ? id " " : "") classify() }
 AWK
 screen_state() { BUSY_REGEX="$BUSY_REGEX" awk "$SCREEN_AWK"; }
-pane_idle() {
-    # In tmux copy-mode the pane is scrolled up, so capture-pane returns the scrolled
-    # viewport, not the live prompt — the busy/queued markers below sit off-screen and
-    # the pane reads as falsely idle. Worse, keys sent to a copy-mode pane are eaten by
-    # copy-mode (/ starts a search), so /compact and /resume never land. Treat any pane
-    # the user is scrolling as not-ready: don't type into it, and retry once they exit.
-    [ "$($TMUX_CMD display-message -p -t "$1" '#{pane_in_mode}' 2>/dev/null)" = 1 ] && return 1
+pane_at_rest() {
     # Waiting on background work counts as idle: a dev server in the background never
     # finishes, so holding /compact for it could stall a pane forever.
     case "$($TMUX_CMD capture-pane -p -t "$1" 2>/dev/null | screen_state)" in ready|background) return 0 ;; esac
     return 1
+}
+pane_idle() {
+    # Keys sent to a copy-mode pane are eaten by copy-mode (/ starts a search), so
+    # /compact and /resume never land. Treat any pane the user is scrolling as not-ready:
+    # don't type into it, and retry once they exit.
+    [ "$($TMUX_CMD display-message -p -t "$1" '#{pane_in_mode}' 2>/dev/null)" = 1 ] && return 1
+    pane_at_rest "$1"
 }
 pane_pending_compact() {
     # A /compact we sent can freeze in the pane's input queue: the agent goes idle
@@ -294,6 +298,9 @@ PANE_STATE=(); PANE_UNSEEN=(); PANE_READ_AT=(); PANE_CONTINUED=(); PANE_QUIET=()
 # "=" panes handing off afresh after a stale fork was dropped. The compaction that made the fork still
 # echoes "❯ /compact" on screen, which pane_pending_compact can't tell from a queued one.
 HANDOFF_REDO=()
+# "=" panes a scroll is holding back this poll, and those whose scroll is already in events.log.
+HANDOFF_HELD=(); HANDOFF_SCROLL_LOGGED=()
+window_viewed() { [ "$1" = 1 ] && [ "${2:-0}" -gt 0 ]; }    # window_active, session_attached
 # The daemon's own handoff -> /compact -> /resume cycle is housekeeping, not a finished turn,
 # until it types a continue that sets Claude working again.
 compaction_in_flight() {
@@ -316,7 +323,7 @@ update_markers() {
             continue
         fi
         claude="$claude $n"; pane_win[$n]="$w"
-        pane_viewed[$n]=0; [ "$wactive" = 1 ] && [ "${attached:-0}" -gt 0 ] && pane_viewed[$n]=1
+        pane_viewed[$n]=0; window_viewed "$wactive" "$attached" && pane_viewed[$n]=1
         # Re-read only panes that printed something since the last read (>= so output in the
         # same second as that read still gets one more read). Keep the last state while scrolling.
         if [ "$inmode" != 1 ] && { [ -z "${PANE_STATE[$n]:-}" ] || [ "${activity:-0}" -ge "${PANE_READ_AT[$n]:-0}" ]; }; then
@@ -345,15 +352,16 @@ update_markers() {
         w="${pane_win[$n]}"
         [ "${pane_viewed[$n]}" = 1 ] && PANE_UNSEEN[$n]=0
         case "${PANE_STATE[$n]:-}" in
-            dialog) r=3 ;;
+            dialog) r=4 ;;
             ready) [ "${PANE_UNSEEN[$n]:-0}" = 1 ] && r=2 || r=0 ;;
             background) r=1 ;;
             *) r=0 ;;
         esac
+        [ "$r" -lt 3 ] && [ "${HANDOFF_HELD[$n]:-0}" = 1 ] && r=3
         [ "$r" -gt "${rank[$w]}" ] && rank[$w]=$r
     done
     for w in $wins; do
-        case "${rank[$w]}" in 3) m='?' ;; 2) m='$' ;; 1) m='&' ;; *) m='' ;; esac
+        case "${rank[$w]}" in 4) m='?' ;; 3) m='^' ;; 2) m='$' ;; 1) m='&' ;; *) m='' ;; esac
         [ "$m" = "${shown_now[$w]}" ] && continue
         if [ -n "$m" ]; then $TMUX_CMD set-option -w -t "@$w" @cc_state "$m"; else $TMUX_CMD set-option -wu -t "@$w" @cc_state; fi
         [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: window @$w marker '${shown_now[$w]}' -> '$m'" >&2
@@ -382,6 +390,24 @@ markers_wanted() {
     [ "$MARKERS_WANTED" = 1 ]
 }
 
+# A window on screen keeps its scroll, because someone is reading it.
+# capture-pane reads the live screen, not the scrolled view, so the checks below work on a scrolled pane.
+unscroll_for_handoff() {
+    local n="${cpane#%}" inmode active attached
+    [ "$ON_PSMUX" = 1 ] && return 0                 # its copy-mode commands are untested
+    read -r inmode active attached <<<"$($TMUX_CMD display-message -p -t "$ctgt" '#{pane_in_mode} #{window_active} #{session_attached}' 2>/dev/null)"
+    if [ "${inmode:-0}" != 1 ]; then unset "HANDOFF_SCROLL_LOGGED[$n]"; return 0; fi
+    # Other modes (choose-tree, say) read as in_mode too, and refuse a copy-mode command.
+    if ! window_viewed "$active" "$attached" && pane_at_rest "$ctgt" && pane_box_empty "$ctgt" \
+        && $TMUX_CMD send-keys -t "$ctgt" -X cancel 2>/dev/null; then
+        evlog "handoff-unscrolled $ctgt $METRIC=$val"
+        return 0
+    fi
+    HANDOFF_HELD[$n]=1
+    [ -n "${HANDOFF_SCROLL_LOGGED[$n]:-}" ] && return 0
+    HANDOFF_SCROLL_LOGGED[$n]=1
+    evlog "handoff-scrolled $ctgt $METRIC=$val"
+}
 # Behavior 2 for a "=" pane at or over its threshold, called with the poll loop's pane variables
 # set. hooks/handoff.py writes $key.handoff ("state session prompt started ended") and, at every
 # Stop, $key.hooked; $hs marks a handoff this daemon typed.
@@ -400,6 +426,7 @@ handoff_step() {
         [ "$(file_mtime "$hooked")" -gt "${HANDOFF_STALE[$n]}" ] || return 0
         unset "HANDOFF_STALE[$n]"
     fi
+    unscroll_for_handoff
     [ -e "$SIGNAL_DIR/$key.handoff" ] && IFS=$'\t' read -r st sess prompt started ended < "$SIGNAL_DIR/$key.handoff"
     is_num "${started:-}" || st=""
     if [ -e "$hs" ]; then
@@ -524,6 +551,7 @@ clear_markers                                       # left behind by a daemon th
 
 while true; do
     { : > "$LOCK/heartbeat"; } 2>/dev/null   # precompact.py leaves compactions to this daemon only while it's fresh
+    HANDOFF_HELD=()
     THRESH="$(conf_get auto_compact_at)"; [ -n "$THRESH" ] || THRESH=300000   # pcconf.py's AUTO_COMPACT_DEFAULT; off is a stored 0
     METRIC="$(conf_get auto_compact_metric)"; [ -n "$METRIC" ] || METRIC="msgs"
     CONTINUE_MSG="$(conf_get resume_continue)"
