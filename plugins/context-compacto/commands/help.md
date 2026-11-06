@@ -49,7 +49,8 @@ Autonomous loop (UNATTENDED, no cap): /cc:autocompact N + /cc:continue MSG make 
   minutes to compact anyway).
 
 Window markers (daemon running, inside tmux): the window option @cc_state is ? when a dialog waits
-  for you, $ when Claude finished while you weren't viewing that window, & when it's idle but
+  for you, ^ when a "=" window over its threshold is scrolled up, which holds its handoff back,
+  $ when Claude finished while you weren't viewing that window, & when it's idle but
   background agents/shells still run. Add #{@cc_state} to window-status-format to see it (README).
 
 Big window: /cc:bigwindow N writes CLAUDE_CODE_AUTO_COMPACT_WINDOW into ~/.claude/settings.json, and
