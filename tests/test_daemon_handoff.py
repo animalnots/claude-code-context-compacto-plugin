@@ -1,4 +1,5 @@
 import fcntl
+import json
 import os
 import pathlib
 import pty
@@ -36,18 +37,20 @@ class Rig:
                         COMPACTO_TMUX=" ".join(self.tmux), CLAUDE_PROJECT_DIR=str(tmp_path / "proj"),
                         COMPACTO_POLL_SECS="0.2", COMPACTO_CONTINUE_SETTLE="1",
                         COMPACTO_MIN_COMPACT_INTERVAL="1", COMPACTO_REARM_GRACE="1",
-                        COMPACTO_COMPACT_COOLDOWN="60", COMPACTO_HANDOFF_START_TIMEOUT="3")
+                        COMPACTO_COMPACT_COOLDOWN="60", COMPACTO_HANDOFF_START_TIMEOUT="3",
+                        COMPACTO_PYTHON=sys.executable, COMPACTO_LIMIT_CHECK_SECS="1")
         self.daemon = None
         self.target = None
         self.clients = []
 
     def start(self, window, msgs, handoff="ok", hooked=True, draft="", daemon=True, resume="ok", ctx=True,
-              compact="ok", old_hooks=False, done_for="3s", dialog=False):
+              compact="ok", old_hooks=False, done_for="3s", dialog=False, context=None, limit="no"):
         cmd = [sys.executable, str(FAKE), "--log", str(self.log), "--transcript", str(self.transcript),
                "--msgs", str(msgs), "--handoff", handoff, "--resume", resume, "--compact", compact,
-               "--done-for", done_for] \
+               "--done-for", done_for, "--limit", limit] \
             + (["--hooked"] if hooked else []) + ([] if ctx else ["--no-ctx"]) \
-            + (["--old-hooks"] if old_hooks else []) + (["--dialog"] if dialog else [])
+            + (["--old-hooks"] if old_hooks else []) + (["--dialog"] if dialog else []) \
+            + (["--ctx", str(context)] if context is not None else [])
         subprocess.run(self.tmux + ["new-session", "-d", "-s", "t", "-n", window, "-x", "120", "-y", "30",
                                     shlex.join(cmd)], env=self.env, check=True)
         self.target = subprocess.run(self.tmux + ["display-message", "-p", "-t", "t", "#{pane_id}"],
@@ -160,6 +163,20 @@ class Rig:
     def want(self, size):
         """A compaction left to the daemon at this size, as the hook leaves Claude Code's own one."""
         self.signal("compactwant").write_text(f"{size}\n")
+
+    def stuck(self):
+        """The session's transcript as one at the context limit leaves it: its last request, after a tool result, refused."""
+        base = {"isSidechain": False, "sessionId": "s-limit", "cwd": "/w", "version": "2.1.322", "userType": "external",
+                "timestamp": "2026-11-11T12:00:00.000Z"}
+        rows = [dict(base, type="user", uuid="u1", parentUuid=None, message={"role": "user", "content": "build it"}),
+                dict(base, type="assistant", uuid="a1", parentUuid="u1", message={
+                    "role": "assistant", "model": "claude-opus-5-5",
+                    "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]}),
+                dict(base, type="user", uuid="r1", parentUuid="a1", message={
+                    "role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}),
+                dict(base, type="assistant", uuid="e1", parentUuid="r1", isApiErrorMessage=True, message={
+                    "role": "assistant", "model": "<synthetic>", "content": [{"type": "text", "text": "Prompt is too long"}]})]
+        self.transcript.write_text("".join(json.dumps(r) + "\n" for r in rows))
 
     def fork(self, fork, age=0):
         """The hook's /resume signal for a fork written age seconds ago."""
@@ -688,6 +705,112 @@ def test_each_scroll_that_holds_a_handoff_back_is_logged_once(rig):
     rig.scroll()
     time.sleep(1.5)
     assert rig.daemon_log().count("handoff-scrolled") == 2
+
+
+@pytest.mark.parametrize("window", ["gloss!", "gloss"])
+def test_past_force_handoff_at_any_window_hands_off_then_compacts(rig, window):
+    rig.start(window, 300000, context=900000)
+    typed = rig.wait_typed(3)
+    assert typed[:2] == ["/compact-handoff", "/compact"] and typed[2].startswith("/resume ")
+    assert "force_handoff_at" in rig.daemon_out.read_text()
+
+
+def test_under_force_handoff_at_a_bang_window_is_left_alone(rig):
+    rig.start("gloss!", 300000, context=790000)
+    time.sleep(4)
+    assert rig.typed() == []
+
+
+@pytest.mark.parametrize("window,first", [("gloss!", None), ("gloss", "/compact")])
+def test_with_force_handoff_at_off_windows_keep_their_own_rules(rig, window, first):
+    (rig.home / ".claude" / "precompact.conf").write_text(f"auto_compact_at={THRESH}\nauto_resume=1\nforce_handoff_at=0\n")
+    rig.start(window, 300000, context=900000)
+    time.sleep(4)
+    assert rig.typed()[:1] == ([first] if first else [])
+
+
+def test_a_handoff_typed_by_hand_is_not_doubled_while_its_turn_ends(rig):
+    rig.start("gloss=", 600000, handoff="lateidle", daemon=False)
+    rig.keys("/compact-handoff", "Enter")
+    rig.wait_for("IDLE_BEFORE_STOP")
+    rig.start_daemon()
+    rig.wait_for("COMPACTED", timeout=30)
+    assert rig.typed()[:2] == ["/compact-handoff", "/compact"]
+    assert "handoff-sent" not in rig.daemon_log()
+
+
+def start_turn_then_daemon(rig, turn):
+    """The daemon would hand off an idle pane past force_handoff_at at once, so it starts once the turn is under way."""
+    rig.keys(turn, "Enter")
+    rig.wait_for(f"TYPED {turn}")
+    rig.start_daemon()
+
+
+def test_a_handoff_claude_runs_itself_is_followed_by_compact_not_a_second_one(rig):
+    rig.start("gloss!", 300000, context=900000, daemon=False)
+    start_turn_then_daemon(rig, "skillturn")
+    rig.wait_for("COMPACTED", timeout=30)
+    assert rig.typed()[:2] == ["skillturn", "/compact"]
+    assert "handoff-sent" not in rig.daemon_log()
+
+
+def test_past_force_handoff_at_claude_is_reminded_mid_turn_and_handed_off_after(rig):
+    rig.start("gloss!", 300000, context=900000, daemon=False)
+    start_turn_then_daemon(rig, "toolturn")
+    rig.wait_for("REMINDED", timeout=10)
+    assert "900k" in next(e for e in rig.events() if e.startswith("REMINDED"))
+    typed = rig.wait_typed(4)
+    assert typed[:3] == ["toolturn", "/compact-handoff", "/compact"]
+
+
+def test_a_handoff_refused_at_the_context_limit_runs_in_a_slim_copy(rig):
+    rig.stuck()
+    rig.start("gloss", 300000, context=974000, limit="yes,no")
+    typed = rig.wait_typed(5, timeout=60)
+    assert typed[0] == "/compact-handoff" and typed[1].startswith("/resume ")
+    assert typed[2:4] == ["/compact-handoff", "/compact"] and typed[4].startswith("/resume ")
+    slim = typed[1].split()[1]
+    assert (rig.transcript.parent / f"{slim}.jsonl").exists() and typed[4] != typed[1]
+    log = rig.daemon_log()
+    assert "limit-slim" in log and f"limit-resume {rig.target} {slim}" in log
+    assert not rig.signal("slim").exists()
+
+
+def test_a_slim_copy_refused_at_the_limit_too_is_left_alone(rig):
+    rig.stuck()
+    rig.start("gloss=", 600000, context=974000, limit="yes")
+    end = time.time() + 60
+    while "limit-wedged" not in rig.daemon_log() and time.time() < end:
+        time.sleep(0.2)
+    rig.signal("ctx").write_text(f"{rig.target}\t974000\t600000\n")   # past force_handoff_at too, which mustn't undo the wedge
+    time.sleep(4)
+    typed = rig.typed()
+    assert typed[0] == "/compact-handoff" and typed[1].startswith("/resume ") and typed[2:] == ["/compact-handoff"]
+    log = rig.daemon_log()
+    assert log.count("limit-wedged") == 1 and log.count("limit-slim") == 1
+
+
+def test_after_a_wedge_its_source_session_is_not_sent_back_to_the_refused_copy(rig):
+    rig.stuck()
+    rig.start("gloss", 300000, context=974000, limit="yes", daemon=False)
+    rig.keys("/compact-handoff", "Enter")
+    rig.wait_for("REFUSED")
+    source = rig.signal("handoff").read_text().split("\t")[1]
+    copy = "00000000-0000-4000-8000-000000000000"
+    (rig.transcript.parent / f"{copy}.jsonl").write_text("")
+    rig.signal("slim").write_text(f"{source}\t{copy}\twedged\n")
+    rig.start_daemon()
+    time.sleep(5)
+    assert not [t for t in rig.typed() if t.startswith("/resume")]
+
+
+def test_the_daemon_says_when_it_cannot_run_slim_fork(rig):
+    rig.env["COMPACTO_PYTHON"] = str(rig.home / "no-python")
+    rig.start_daemon()
+    end = time.time() + 10
+    while "stays stuck" not in rig.daemon_out.read_text() and time.time() < end:
+        time.sleep(0.2)
+    assert "a handoff refused at the context limit stays stuck" in rig.daemon_out.read_text()
 
 
 def test_a_waiting_dialog_keeps_its_marker_in_a_scrolled_window(rig):
