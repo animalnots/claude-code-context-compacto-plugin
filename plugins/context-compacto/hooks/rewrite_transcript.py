@@ -18,9 +18,7 @@ Beyond selecting the head/tail windows by token budget, this also:
   - strips `message.usage` (cached API token counts) and `toolUseResult` metadata
   - reassigns every UUID so Claude Code can't re-hydrate the fork from other session files
 
-`slim()` writes the other kind of fork: of a session stuck at the context limit, the conversation since Claude
-Code's last compaction of it, up to its last request, without thinking or images and with long tool outputs
-capped, so a turn fits again.
+`slim()` writes the other kind of fork: a smaller copy of a session stuck at the context limit, so a turn fits again.
 
 Defaults (when no env / config is set): head_tokens=0, tail_tokens=25000.
 Both can be overridden via env:

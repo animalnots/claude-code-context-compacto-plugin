@@ -119,7 +119,9 @@ HANDOFF_START_TIMEOUT="${COMPACTO_HANDOFF_START_TIMEOUT:-60}"
 # daemon types /compact instead of a second handoff.
 HANDOFF_ADOPT=120
 LIMIT_CHECK_SECS="${COMPACTO_LIMIT_CHECK_SECS:-10}"
-HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Python on Windows reads Git Bash's /c/Users/... as C:\c\Users\..., and MSYS_NO_PATHCONV above keeps Git Bash
+# from converting it, so this takes the C:/Users/... form; only Git Bash's pwd has -W.
+HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && { pwd -W 2>/dev/null || pwd; })"
 # hooks.json runs the hooks with "python".
 PYTHON="${COMPACTO_PYTHON:-$(command -v python 2>/dev/null || command -v python3 2>/dev/null)}"
 DEBUG="${COMPACTO_DEBUG:-}"                      # set to 1 to log pane state at each auto-compact fire
@@ -656,7 +658,8 @@ drop_outlived_fork() {
 }
 
 echo "compacto-resume-daemon: watching $SIGNAL_DIR (poll ${POLL}s, tmux='$TMUX_CMD'). Ctrl-C to stop."
-[ -n "$PYTHON" ] && command -v "$PYTHON" >/dev/null && [ -f "$HOOKS_DIR/slim_fork.py" ] \
+# Not [ -f ]: Python on Windows can't open some paths that bash can.
+[ -n "$PYTHON" ] && "$PYTHON" -c 'import sys; open(sys.argv[1])' "$HOOKS_DIR/slim_fork.py" >/dev/null 2>&1 \
     || echo "compacto-resume-daemon: can't run $HOOKS_DIR/slim_fork.py (no Python found, or no such file), so a handoff refused at the context limit stays stuck; set COMPACTO_PYTHON, or run this script from the plugin's hooks folder" >&2
 clear_markers                                       # left behind by a daemon that was SIGKILLed
 

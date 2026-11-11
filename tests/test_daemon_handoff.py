@@ -877,8 +877,9 @@ def test_after_a_wedge_its_source_session_is_not_sent_back_to_the_refused_copy(r
     assert not [t for t in rig.typed() if t.startswith("/resume")]
 
 
-def test_the_daemon_says_when_it_cannot_run_slim_fork(rig):
-    rig.env["COMPACTO_PYTHON"] = str(rig.home / "no-python")
+@pytest.mark.parametrize("python", [None, "false"], ids=["no such Python", "a Python that can't open it"])
+def test_the_daemon_says_when_it_cannot_run_slim_fork(rig, python):
+    rig.env["COMPACTO_PYTHON"] = python or str(rig.home / "no-python")
     rig.start_daemon()
     end = time.time() + 10
     while "stays stuck" not in rig.daemon_out.read_text() and time.time() < end:
