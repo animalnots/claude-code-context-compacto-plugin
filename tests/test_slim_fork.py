@@ -27,6 +27,8 @@ def entry(kind, uid, parent, content, ts="2026-11-11T12:00:00.000Z", **kw):
          "message": {"role": kind, "content": content}}
     if kind == "assistant":
         e["message"]["model"] = kw.pop("model", "claude-opus-5-5")
+    if "message_id" in kw:
+        e["message"]["id"] = kw.pop("message_id")
     e.update(kw)
     return e
 
@@ -59,9 +61,13 @@ def conversation(last_tool_result=True):
                                         {"type": "text", "text": "looking at it"}]),
     ]
     if last_tool_result:
-        rows += [entry("assistant", "a4", "a3", [{"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "/w/x"}}]),
+        rows += [entry("assistant", "a4", "a3", [{"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "/w/x"}}],
+                       message_id="m4"),
+                 entry("assistant", "a5", "a4", [{"type": "tool_use", "id": "t3", "name": "Read", "input": {"file_path": "/w/y"}}],
+                       message_id="m4"),
                  entry("user", "r2", "a4", [{"type": "tool_result", "tool_use_id": "t2", "content": "short"}]),
-                 refused("e1", "r2", ts="2026-11-11T14:31:03.039Z")] + handoff_prompt("e1")
+                 entry("user", "r3", "a5", [{"type": "tool_result", "tool_use_id": "t3", "content": "also short"}]),
+                 refused("e1", "r3", ts="2026-11-11T14:31:03.039Z")] + handoff_prompt("e1")
     else:
         rows += [entry("user", "u2", "a3", "and the other one", promptId="p-2"),
                  refused("e1", "u2", ts="2026-11-11T14:31:03.039Z")] + handoff_prompt("e1")
@@ -86,6 +92,32 @@ def texts(rows):
     return json.dumps(messages(rows))
 
 
+def tool_ids(m, kind):
+    """The ids of m's tool_use blocks, or of the calls its tool_result blocks answer."""
+    c = m.get("message", {}).get("content")
+    return [b["id" if kind == "tool_use" else "tool_use_id"] for b in (c if isinstance(c, list) else []) if b.get("type") == kind]
+
+
+def tool_results(rows):
+    return [i for m in messages(rows) for i in tool_ids(m, "tool_result")]
+
+
+def loaded(rows):
+    """The messages Claude Code loads from a session, in file order: the parentUuid walk back from the last one, and
+    for each reply on it, the reply's other entries (same message.id) and the tool results parented to them."""
+    by_uuid = {r["uuid"]: r for r in rows if r.get("uuid")}
+    walk, cur = [], messages(rows)[-1]
+    while cur is not None:
+        walk.append(cur)
+        cur = by_uuid.get(cur.get("parentUuid"))
+    # Claude Code orders what it loads along the walk, so file order stands in for that only if every link points back.
+    assert walk[::-1] == [r for r in rows if r in walk]
+    ids = {m["message"].get("id") for m in walk if m.get("type") == "assistant"} - {None}
+    replies = {m["uuid"] for m in messages(rows) if m["type"] == "assistant" and m["message"].get("id") in ids}
+    return [r for r in rows if r in walk or r.get("uuid") in replies
+            or r.get("parentUuid") in replies and tool_ids(r, "tool_result")]
+
+
 @pytest.fixture
 def stuck(tmp_path):
     return write(tmp_path, conversation())
@@ -95,7 +127,9 @@ def test_the_slim_copy_keeps_every_message_and_tool_call_without_thinking(tmp_pa
     rows = fork_rows(tmp_path, rewrite_transcript.slim(str(stuck)))
     blocks = [[b["type"] for b in m["message"]["content"]] if isinstance(m["message"]["content"], list) else ["str"]
               for m in messages(rows)]
-    assert blocks == [["str"], ["tool_use"], ["tool_result"], ["text"], ["tool_use"], ["tool_result"], ["text"]]
+    assert blocks == [["str"], ["tool_use"], ["tool_result"], ["text"], ["tool_use"], ["tool_use"], ["tool_result"],
+                      ["tool_result"], ["text"]]
+    assert tool_results(rows) == ["t1", "t2", "t3"]
     assert '"thinking"' not in texts(rows)
 
 
@@ -138,18 +172,66 @@ def test_a_reply_cut_off_before_its_tool_result_is_left_out(tmp_path):
     assert messages(rows)[-1]["message"]["content"] == [{"type": "text", "text": "looking at it"}]
 
 
-def test_the_copy_is_a_session_of_its_own_whose_chain_reaches_every_message(tmp_path, stuck):
+def test_the_copy_is_a_session_of_its_own_and_claude_code_loads_all_of_it(tmp_path, stuck):
     new_id = rewrite_transcript.slim(str(stuck))
     rows = fork_rows(tmp_path, new_id)
     source = {r.get("uuid") for r in conversation()} - {None}
     assert not source & {r.get("uuid") for r in rows}
     assert {r["sessionId"] for r in rows if "sessionId" in r} == {new_id}
-    by_uuid = {r["uuid"]: r for r in rows if r.get("uuid")}
-    walked, cur = 0, messages(rows)[-1]
-    while cur is not None:
-        walked += 1
-        cur = by_uuid.get(cur.get("parentUuid"))
-    assert walked == len(messages(rows))
+    assert loaded(rows) == messages(rows)
+
+
+def calls_and_results(rows):
+    """The entries holding each tool call, and those holding each tool result, both by call id."""
+    calls = {i: m for m in messages(rows) for i in tool_ids(m, "tool_use")}
+    results = {i: m for m in messages(rows) for i in tool_ids(m, "tool_result")}
+    return calls, results
+
+
+def parallel_calls(first, second):
+    """A reply calling tA and tB at once, their results back in the order given, then a prompt the limit refused."""
+    results = {"A": entry("user", "rA", "a1", [{"type": "tool_result", "tool_use_id": "tA", "content": "result A"}]),
+               "B": entry("user", "rB", "a2", [{"type": "tool_result", "tool_use_id": "tB", "content": "result B"}])}
+    return [
+        entry("user", "u1", None, "open both screens"),
+        entry("assistant", "a1", "u1", [{"type": "tool_use", "id": "tA", "name": "Bash", "input": {"command": "a"}}],
+              message_id="m1"),
+        entry("assistant", "a2", "a1", [{"type": "tool_use", "id": "tB", "name": "Bash", "input": {"command": "b"}}],
+              message_id="m1"),
+        results[first], results[second],
+        entry("assistant", "a3", f"r{second}", [{"type": "text", "text": "both done"}]),
+        entry("user", "u2", "a3", "next", promptId="p-2"),
+        refused("e1", "u2", ts="2026-11-11T14:31:03.039Z"),
+    ] + handoff_prompt("e1")
+
+
+def test_each_of_a_replys_parallel_calls_keeps_its_result(tmp_path):
+    copy = fork_rows(tmp_path, rewrite_transcript.slim(str(write(tmp_path, parallel_calls("A", "B")))))
+    assert tool_results(copy) == ["tA", "tB"]
+    calls, results = calls_and_results(copy)
+    assert {i: m["parentUuid"] for i, m in results.items()} == {i: m["uuid"] for i, m in calls.items()}
+    assert {m["message"]["id"] for m in calls.values()} == {"m1"}
+    assert loaded(copy) == messages(copy)
+
+
+def test_a_call_the_walk_skips_comes_back_with_its_result(tmp_path):
+    copy = fork_rows(tmp_path, rewrite_transcript.slim(str(write(tmp_path, parallel_calls("B", "A")))))
+    assert tool_results(copy) == ["tB", "tA"]
+    calls, results = calls_and_results(copy)
+    assert {i: m["parentUuid"] for i, m in results.items()} == {i: m["uuid"] for i, m in calls.items()}
+    assert loaded(copy) == messages(copy)
+
+
+def test_a_parallel_call_still_waiting_for_its_result_at_the_limit_is_left_out(tmp_path):
+    rows = conversation()
+    a5 = rows.index(next(r for r in rows if r.get("uuid") == "a5"))
+    rows = rows[:a5] + [entry("user", "r2", "a4", [{"type": "tool_result", "tool_use_id": "t2", "content": "short"}]),
+                        dict(rows[a5], parentUuid="r2"), refused("e1", "a5")] + handoff_prompt("e1")
+    copy = fork_rows(tmp_path, rewrite_transcript.slim(str(write(tmp_path, rows))))
+    assert tool_results(copy) == ["t1", "t2"] and '"t3"' not in texts(copy)
+    assert loaded(copy) == messages(copy)
+    *_, result, closing = messages(copy)
+    assert tool_ids(result, "tool_result") == ["t2"] and closing["parentUuid"] == result["uuid"]
 
 
 def native_compaction(tag, before):
@@ -173,20 +255,15 @@ def after_compactions(*tags):
 
 
 def copy_texts(tmp_path, rows):
-    """The copy's messages, as their text or their first block's type, in chain order from its last message."""
+    """The messages Claude Code loads from the copy, as their text or their first block's type, in order."""
     copy = fork_rows(tmp_path, rewrite_transcript.slim(str(write(tmp_path, rows))))
-    by_uuid = {r["uuid"]: r for r in copy if r.get("uuid")}
-    chain, cur = [], messages(copy)[-1]
-    while cur is not None:
-        c = cur["message"]["content"]
-        chain.append(c if isinstance(c, str) else c[0].get("text") or c[0]["type"])
-        cur = by_uuid.get(cur.get("parentUuid"))
-    assert len(chain) == len(messages(copy))
-    return chain[::-1]
+    chain = loaded(copy)
+    assert chain == messages(copy)
+    return [c if isinstance(c, str) else c[0].get("text") or c[0]["type"] for c in (m["message"]["content"] for m in chain)]
 
 
-AFTER_THE_SUMMARY = ["build the pill", "tool_use", "tool_result", "looking at it", "tool_use", "tool_result",
-                     rewrite_transcript.SLIM_NOTE.format(cap=rewrite_transcript.MAX_BLOCK_TOKENS)]
+AFTER_THE_SUMMARY = ["build the pill", "tool_use", "tool_result", "looking at it", "tool_use", "tool_use", "tool_result",
+                     "tool_result", rewrite_transcript.SLIM_NOTE.format(cap=rewrite_transcript.MAX_BLOCK_TOKENS)]
 
 
 def test_the_copy_starts_at_the_summary_of_a_compaction_claude_code_ran(tmp_path):
@@ -195,6 +272,20 @@ def test_the_copy_starts_at_the_summary_of_a_compaction_claude_code_ran(tmp_path
 
 def test_after_several_compactions_the_copy_starts_at_the_last_summary(tmp_path):
     assert copy_texts(tmp_path, after_compactions("A", "B", "C")) == ["summary C"] + AFTER_THE_SUMMARY
+
+
+def test_a_parallel_reply_from_before_the_last_compaction_stays_out(tmp_path):
+    rows = after_compactions("A", "B")
+    w = rows.index(next(r for r in rows if r.get("uuid") == "w-B"))
+    rows[w:w + 1] = [
+        entry("assistant", "o1", "q-B", [{"type": "tool_use", "id": "oA", "name": "Bash", "input": {"command": "a"}}],
+              message_id="m-old"),
+        entry("assistant", "o2", "o1", [{"type": "tool_use", "id": "oB", "name": "Bash", "input": {"command": "b"}}],
+              message_id="m-old"),
+        entry("user", "or1", "o1", [{"type": "tool_result", "tool_use_id": "oA", "content": "old A"}]),
+        entry("user", "or2", "o2", [{"type": "tool_result", "tool_use_id": "oB", "content": "old B"}]),
+        dict(rows[w], parentUuid="or2")]
+    assert copy_texts(tmp_path, rows) == ["summary B"] + AFTER_THE_SUMMARY
 
 
 def test_a_boundary_no_summary_follows_is_passed_by(tmp_path):

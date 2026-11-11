@@ -283,8 +283,8 @@ type_text() {
 }
 # "=" hands a window off before compacting; "!" opts it out altogether and wins.
 handoff_window() { [[ "$1" == *'='* && "$1" != *'!'* ]]; }
-# Whatever its window's name, a pane hands off before compacting past force_handoff_at ($1 its context size),
-# and so does one resumed into a slim copy made at the context limit, until that copy is compacted.
+# Whatever its window's name, "!" included, a pane hands off before compacting once its context size ($1)
+# reaches force_handoff_at.
 over_force_limit() { [ "$FORCE" -gt 0 ] && is_num "${1:-}" && [ "$1" -ge "$FORCE" ]; }
 # <key>.slim is "source session<TAB>slim copy", and a third field once the copy was refused at the limit too.
 # It holds while the pane's last Stop was in either one: the source's, until a turn ends in the resumed copy.

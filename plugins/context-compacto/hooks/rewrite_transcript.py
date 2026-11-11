@@ -702,8 +702,9 @@ def _closing_reply(template: Dict, parent_uuid: str, new_id: str, now_iso: str) 
 
 
 def _loaded_chain(entries: List[Dict], leaf: Dict) -> set:
-    """The uuids on Claude Code's parentUuid walk back from leaf when it resumes there. The walk stops at the
-    boundary of the last compaction Claude Code ran itself, or at a parent missing from the file."""
+    """The uuids Claude Code loads when it resumes at leaf: its parentUuid walk back from there, to the boundary of
+    its own last compaction or a parent missing from the file, and each walked reply's other entries with their tool
+    results, which the walk misses: a reply's parallel calls are an entry each, and each result hangs off its call."""
     by_uuid = {}
     for e in entries:
         if e.get("uuid"):
@@ -714,14 +715,25 @@ def _loaded_chain(entries: List[Dict], leaf: Dict) -> set:
             break
         chain.add(e.get("uuid"))
         e = by_uuid.get(e.get("parentUuid"))
-    return chain
+
+    def reply_id(e):
+        return e.get("type") == "assistant" and e.get("message", {}).get("id") or None
+
+    def has_result(e):
+        c = e.get("message", {}).get("content")
+        return e.get("type") == "user" and isinstance(c, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in c)
+
+    replies = {reply_id(e) for e in entries if e.get("uuid") in chain} - {None}
+    parts = {e.get("uuid") for e in entries if reply_id(e) in replies}
+    return chain | parts | {e.get("uuid") for e in entries if e.get("parentUuid") in parts and has_result(e)}
 
 
 def slim(orig_path: str, projects_dir: str = None) -> str:
     """Writes a slim copy of a session at the context limit to <projects_dir>/<new_id>.jsonl, returns new_id.
 
-    The copy keeps the messages on the session's chain up to its last request, back to the summary of the last
-    compaction Claude Code ran itself if there was one, without their thinking and images, and with tool outputs
+    The copy keeps the messages Claude Code would load resuming the session at its last request, back to the summary
+    of Claude Code's own last compaction if there was one, without their thinking and images, and with tool outputs
     capped at MAX_BLOCK_TOKENS. The requests the limit refused after that, and the prompts they carried, are left
     out. A closing reply follows a last tool result, so the next prompt opens a turn of its own instead of carrying
     on a tool call whose thinking is gone.
