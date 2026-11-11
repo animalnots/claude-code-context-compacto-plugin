@@ -18,6 +18,9 @@ Beyond selecting the head/tail windows by token budget, this also:
   - strips `message.usage` (cached API token counts) and `toolUseResult` metadata
   - reassigns every UUID so Claude Code can't re-hydrate the fork from other session files
 
+`slim()` writes the other kind of fork: a session stuck at the context limit, whole up to its last
+request but without thinking or images, and with long tool outputs capped, so a turn fits again.
+
 Defaults (when no env / config is set): head_tokens=0, tail_tokens=25000.
 Both can be overridden via env:
   PRECOMPACT_HEAD_TOKENS / PRECOMPACT_TAIL_TOKENS  (absolute)
@@ -27,6 +30,7 @@ Both can be overridden via env:
 """
 import json
 import os
+import re
 import shutil
 import uuid
 import datetime
@@ -134,6 +138,68 @@ def _load_entries(path: str) -> List[Dict]:
             except json.JSONDecodeError:
                 pass
     return entries
+
+
+def last_entry(path: str, match: Callable[[Dict], bool], tail_bytes: int = 4 << 20) -> Optional[Dict]:
+    """The last entry of the transcript that match accepts, or None. The tail is read first, and the whole
+    file only when the tail has none, since transcripts of big sessions run to hundreds of MB."""
+    with open(path, "rb") as f:
+        size = f.seek(0, os.SEEK_END)
+        for start in ([size - tail_bytes, 0] if size > tail_bytes else [0]):
+            f.seek(start)
+            lines = f.read().splitlines()[1 if start else 0:]
+            for raw in reversed(lines):
+                try:
+                    e = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and match(e):
+                    return e
+    return None
+
+
+JUNK_TITLE_PREFIXES = (
+    "<local-command-caveat>",
+    "<local-command-stdout>",
+    "<command-name>",
+    "<command-message>",
+)
+
+
+def _source_title(entries: List[Dict]) -> Optional[str]:
+    """The latest meaningful custom-title, to carry the session's name into a fork.
+
+    Skips auto-generated junk that Claude Code derives from caveat/command wrappers (happens when the
+    first user "message" is a slash-command echo), and strips an existing `— compact MM-DD HH:MM` or
+    `— slim MM-DD HH:MM` suffix to avoid stacking on repeated forks.
+    """
+    source_title = None
+    for _e in entries:
+        if _e.get("type") == "custom-title":
+            _ct = (_e.get("customTitle") or "").strip()
+            if _ct and not _ct.startswith(JUNK_TITLE_PREFIXES):
+                source_title = re.sub(
+                    r"\s*—\s*(?:compact|slim)\s+\d{2}-\d{2}\s+\d{2}:\d{2}\s*$", "", _ct
+                ).strip()
+    return source_title
+
+
+def _conversation(entries: List[Dict]) -> List[Dict]:
+    # Dedupe by UUID and drop pure command-stdout wrappers up front so window
+    # selection sees the same set of entries that will actually be preserved.
+    seen = set()
+    convo = []
+    for e in entries:
+        if e.get("type") not in ("user", "assistant"):
+            continue
+        u = e.get("uuid")
+        if u in seen:
+            continue
+        if _is_command_stdout_artifact(e) or _is_thinking_only(e):
+            continue
+        seen.add(u)
+        convo.append(e)
+    return convo
 
 
 def _build_synthetic(template: Dict, parent_uuid: str, summary: str,
@@ -365,42 +431,8 @@ def rewrite(orig_path: str, summary: str, projects_dir: str = None) -> str:
         projects_dir = os.path.dirname(orig_path)
 
     entries = _load_entries(orig_path)
-
-    # Capture the latest meaningful custom-title from the source so we can
-    # carry the session's name into the fork. Skip auto-generated junk that
-    # Claude Code derives from caveat/command wrappers (happens when the first
-    # user "message" is a slash-command echo). Strip any existing
-    # `— compact MM-DD HH:MM` suffix to avoid stacking on repeated compacts.
-    import re as _re
-    JUNK_TITLE_PREFIXES = (
-        "<local-command-caveat>",
-        "<local-command-stdout>",
-        "<command-name>",
-        "<command-message>",
-    )
-    source_title = None
-    for _e in entries:
-        if _e.get("type") == "custom-title":
-            _ct = (_e.get("customTitle") or "").strip()
-            if _ct and not _ct.startswith(JUNK_TITLE_PREFIXES):
-                source_title = _re.sub(
-                    r"\s*—\s*compact\s+\d{2}-\d{2}\s+\d{2}:\d{2}\s*$", "", _ct
-                ).strip()
-
-    convo_all = [e for e in entries if e.get("type") in ("user", "assistant")]
-
-    # Dedupe by UUID and drop pure command-stdout wrappers up front so window
-    # selection sees the same set of entries that will actually be preserved.
-    seen = set()
-    convo = []
-    for e in convo_all:
-        u = e.get("uuid")
-        if u in seen:
-            continue
-        if _is_command_stdout_artifact(e) or _is_thinking_only(e):
-            continue
-        seen.add(u)
-        convo.append(e)
+    source_title = _source_title(entries)
+    convo = _conversation(entries)
 
     N = len(convo)
     if N < 2:
@@ -540,10 +572,16 @@ def rewrite(orig_path: str, summary: str, projects_dir: str = None) -> str:
     if not inserted:
         # No head_of_last match during walk — happens when tail is empty
         # (nothing to insert before). Append synth at the end; chain repair
-        # below will link it to the preceding convo entry.
+        # in _finish_fork will link it to the preceding convo entry.
         out.append(synthetic)
         inserted = True
 
+    _finish_fork(out, new_id, projects_dir, source_title, "compact")
+    return new_id
+
+
+def _finish_fork(out: List[Dict], new_id: str, projects_dir: str, source_title: Optional[str], kind: str) -> None:
+    """Links up and renames the fork's entries, titles it "<source title> — <kind> MM-DD HH:MM", and writes it."""
     # Repair the parentUuid chain so Claude Code can walk it on resume.
     # Claude Code's chain can reference attachments as parents in a native
     # transcript, but we need a valid convo-to-convo chain in the fork because
@@ -588,7 +626,7 @@ def rewrite(orig_path: str, summary: str, projects_dir: str = None) -> str:
     # Preserve the source session's name (if any) as a prefix.
     stamp = datetime.datetime.now().strftime("%m-%d %H:%M")
     fork_title = (
-        f"{source_title} — compact {stamp}" if source_title else f"compact {stamp}"
+        f"{source_title} — {kind} {stamp}" if source_title else f"{kind} {stamp}"
     )
     out.append({
         "type": "custom-title",
@@ -601,6 +639,117 @@ def rewrite(orig_path: str, summary: str, projects_dir: str = None) -> str:
         for e in out:
             f.write(json.dumps(e) + "\n")
 
+
+IMAGE_PLACEHOLDER = "[image left out of the slim copy]"
+SLIM_NOTE = ("This turn stopped when the conversation reached the context limit, so this copy of the session "
+             "leaves out its thinking and images and cuts tool outputs over {cap} tokens, to fit again.")
+
+
+def _without_images(entry: Dict) -> Dict:
+    """entry with each image, in its content or in a tool result's, swapped for IMAGE_PLACEHOLDER."""
+    msg = entry.get("message", {})
+    c = msg.get("content")
+    if not isinstance(c, list):
+        return entry
+
+    def swap(blocks):
+        return [{"type": "text", "text": IMAGE_PLACEHOLDER} if isinstance(b, dict) and b.get("type") == "image" else b
+                for b in blocks]
+
+    new_c = [dict(b, content=swap(b["content"]))
+             if isinstance(b, dict) and b.get("type") == "tool_result" and isinstance(b.get("content"), list) else b
+             for b in swap(c)]
+    if new_c == c:
+        return entry
+    return {**entry, "message": {**msg, "content": new_c}}
+
+
+def _refused_tail(entry: Dict) -> bool:
+    """Whether entry, met walking back from the end of a session at the context limit, is part of what the
+    limit left there: an API error, a prompt a refused request carried, or a reply whose tool call never got
+    a result (one that did would be met after its result)."""
+    if entry.get("isApiErrorMessage"):
+        return True
+    c = entry.get("message", {}).get("content")
+    blocks = [b for b in c if isinstance(b, dict)] if isinstance(c, list) else []
+    if entry.get("type") == "user":
+        return not any(b.get("type") == "tool_result" for b in blocks)
+    return any(b.get("type") == "tool_use" for b in blocks)
+
+
+def _closing_reply(template: Dict, parent_uuid: str, new_id: str, now_iso: str) -> Dict:
+    return {
+        "parentUuid": parent_uuid,
+        "isSidechain": False,
+        "type": "assistant",
+        "message": {
+            "id": "msg_" + uuid.uuid4().hex[:24],
+            "type": "message",
+            "role": "assistant",
+            "model": (template.get("message") or {}).get("model"),
+            "content": [{"type": "text", "text": SLIM_NOTE.format(cap=MAX_BLOCK_TOKENS)}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+        },
+        "uuid": str(uuid.uuid4()),
+        "timestamp": now_iso,
+        "userType": template.get("userType", "external"),
+        "cwd": template.get("cwd"),
+        "sessionId": new_id,
+        "version": template.get("version"),
+        "gitBranch": template.get("gitBranch", ""),
+    }
+
+
+def slim(orig_path: str, projects_dir: str = None) -> str:
+    """Writes a slim copy of a session at the context limit to <projects_dir>/<new_id>.jsonl, returns new_id.
+
+    The copy keeps the conversation up to the session's last request, whole but for its thinking and images,
+    with tool outputs capped at MAX_BLOCK_TOKENS. The requests the limit refused after that, and the prompts
+    they carried, are left out. A closing reply follows a last tool result, so the next prompt opens a turn of
+    its own instead of carrying on a tool call whose thinking is gone.
+    Raises ValueError when no such request is left to keep.
+    """
+    if projects_dir is None:
+        projects_dir = os.path.dirname(orig_path)
+    entries = _load_entries(orig_path)
+    convo = _conversation(entries)
+    end = next((i for i in range(len(convo) - 1, -1, -1) if not _refused_tail(convo[i])), None)
+    if end is None:
+        raise ValueError("no request in the session to keep")
+    last = convo[end]
+    keep = {e.get("uuid") for e in convo[:end + 1]}
+    cut = next(i for i, e in enumerate(entries) if e is last)
+    template = next((e for e in reversed(convo[:end + 1])
+                     if e.get("type") == "assistant" and not e.get("isApiErrorMessage")), last)
+
+    new_id = str(uuid.uuid4())
+    out: List[Dict] = []
+    emitted = set()
+    for i, e in enumerate(entries):
+        t = e.get("type")
+        # What came after the last request kept is the refused requests' own: their prompts, errors and hooks.
+        if i > cut and (e.get("uuid") or t == "attachment"):
+            continue
+        if t in ("user", "assistant"):
+            u = e.get("uuid")
+            if u not in keep or u in emitted:
+                continue
+            emitted.add(u)
+            e = _without_images(_strip_ephemeral(e))
+        elif t == "attachment":
+            e = _cap_attachment(e)
+        elif t == "custom-title":
+            continue
+        e2 = dict(e)
+        if "sessionId" in e2:
+            e2["sessionId"] = new_id
+        out.append(e2)
+        if i == cut and t == "user":
+            out.append(_closing_reply(template, last.get("uuid"), new_id,
+                                      datetime.datetime.utcnow().isoformat() + "Z"))
+
+    _finish_fork(out, new_id, projects_dir, _source_title(entries), "slim")
     return new_id
 
 
