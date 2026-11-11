@@ -150,10 +150,11 @@ def _show():
     # absent auto_compact_at means the default threshold, so dumping the file alone
     # can't tell what is in force. Always spell them out.
     conf = _read_conf()
-    print("automation:  auto_resume={}  auto_compact_at={} ({})  resume_continue={}".format(
+    print("automation:  auto_resume={}  auto_compact_at={} ({})  force_handoff_at={}  resume_continue={}".format(
         "on" if conf.get("auto_resume") else "off",
         _auto_compact_state(conf),
         conf.get("auto_compact_metric") or "msgs",
+        _force_handoff_state(conf),
         conf.get("resume_continue") or "off",
     ))
 
@@ -164,6 +165,13 @@ def _auto_compact_state(conf):
     if not cur:
         return "{} (default)".format(AUTO_COMPACT_DEFAULT)
     return "off" if cur == "0" else cur
+
+
+def _force_handoff_state(conf):
+    at = handoff.force_handoff_at()
+    if not at:
+        return "off"
+    return str(at) if conf.get("force_handoff_at") else "{} (default)".format(at)
 
 
 def _report_state(key, usage, extra=None, state=None):
@@ -382,9 +390,14 @@ Autonomous loop (UNATTENDED, no cap): /cc:autocompact N + /cc:continue MSG make 
   /compact is refused once (repeat it within 2 minutes to compact anyway).
   In other windows, Claude Code's own auto compaction (it fires mid-turn) is left
   to the daemon, which /compacts the pane at its next idle prompt.
+  Past force_handoff_at=N context tokens in the config file (default 800000, 0 = off)
+  every window hands off then compacts that way, ! ones too: Claude is asked mid-turn
+  to run the handoff and end its turn, and the daemon types it at the next idle prompt
+  unless it just ran. A handoff refused at the context limit runs in a slim copy of
+  the session (no thinking or images, long tool outputs cut), which the daemon resumes.
 
 Window markers (daemon running, inside tmux): the window option @cc_state is
-  ? when a dialog waits for you, ^ when a "=" window over its threshold is scrolled
+  ? when a dialog waits for you, ^ when a window due a handoff is scrolled
   up, which holds its handoff back, $ when Claude finished while you weren't viewing
   that window, & when it's idle but background agents/shells still run. Add
   #{@cc_state} to window-status-format to see it (see README).
@@ -404,7 +417,7 @@ Scope: ~/.claude/precompact.conf is GLOBAL. Edits take effect on the NEXT compac
   in any session — current, other running sessions, or future ones. No per-session
   snapshot. Env vars (if set) override the file for that shell.
 
-Defaults (no config, no env): head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]  auto_resume=off  auto_compact_at=300000  resume_continue=off
+Defaults (no config, no env): head_tokens=0  tail_tokens=25000  model_200k=sonnet  model_1m=opus[1m]  auto_resume=off  auto_compact_at=300000  force_handoff_at=800000  resume_continue=off
 Config file: ~/.claude/precompact.conf
 
 Precedence per window (head and tail resolved independently):
