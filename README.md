@@ -82,7 +82,7 @@ Go further and let a long task run *itself* across compactions: **auto-compact a
 /cc:continue continue      # after each auto-compaction resumes, send "continue"
 ```
 
-**⚠ Unbounded and hands-off** — compact → resume → continue → repeat, spending tokens with no human and no cap until you stop the daemon (`Ctrl-C`) or run `/cc:autocompact off`. It also needs a small export added to your statusline so the daemon can read the live context size. A `!` in a tmux window's name exempts that window; a `=` makes it run `/compact-handoff` at twice the threshold and compact only after that handoff has finished. Elsewhere, Claude Code's own mid-turn auto compaction is left to the daemon, which compacts at the next idle prompt so the fork keeps the whole turn. Setup, safeguards, and idle-detection tuning are in the [plugin README](plugins/context-compacto/README.md#autonomous-loop-auto-compact--continue--advanced-unattended); on Windows, see [Windows (psmux)](plugins/context-compacto/README.md#windows-psmux).
+**⚠ Unbounded and hands-off** — compact → resume → continue → repeat, spending tokens with no human and no cap until you stop the daemon (`Ctrl-C`) or run `/cc:autocompact off`. It also needs a small export added to your statusline so the daemon can read the live context size. A `!` in a tmux window's name exempts that window; a `=` makes it run `/compact-handoff` at twice the threshold and compact only after that handoff has finished. Past `force_handoff_at` (800k context tokens by default) every window hands off and compacts that way, `!` ones too, except a session whose handoff never starts (no such command, say), which keeps its window's own rule; a handoff refused at the context limit runs in a slim copy of the session. Elsewhere, Claude Code's own mid-turn auto compaction is left to the daemon, which compacts at the next idle prompt so the fork keeps the whole turn. Setup, safeguards, and idle-detection tuning are in the [plugin README](plugins/context-compacto/README.md#autonomous-loop-auto-compact--continue--advanced-unattended); on Windows, see [Windows (psmux)](plugins/context-compacto/README.md#windows-psmux).
 
 ## Requirements
 
@@ -117,9 +117,10 @@ Then re-run `/plugin install` if there are version changes.
 │       ├── hooks/
 │       │   ├── hooks.json              hook registration
 │       │   ├── precompact.py           hook entry point
-│       │   ├── handoff.py              tracks /compact-handoff runs for the "=" marker and the compaction guard
+│       │   ├── handoff.py              tracks /compact-handoff runs for the daemon and the compaction guard
 │       │   ├── pcconf.py               config helper for slash commands
 │       │   ├── rewrite_transcript.py   JSONL fork writer
+│       │   ├── slim_fork.py            the daemon's slim copy of a session at the context limit
 │       │   └── compacto-resume-daemon.sh  optional tmux auto-resume watcher
 │       ├── commands/                   /cc:begin /cc:end /cc:both /cc:begin-pct /cc:end-pct /cc:both-pct /cc:model /cc:autoresume /cc:autocompact /cc:continue /cc:bigwindow /cc:show /cc:reset /cc:help
 │       └── README.md                   plugin docs (full usage + config)

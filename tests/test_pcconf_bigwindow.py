@@ -182,3 +182,18 @@ def test_names_each_pane_and_skips_panes_that_are_gone(env, settings):
         assert "%99999" not in out
     finally:
         subprocess.run(cmd + ["kill-server"], capture_output=True)
+
+
+@pytest.mark.parametrize("conf,shown", [
+    (None, "force_handoff_at=800000 (default)"),
+    ("force_handoff_at=900000\n", "force_handoff_at=900000  "),
+    ("force_handoff_at=0\n", "force_handoff_at=off"),
+    ("force_handoff_at=800k\n", "force_handoff_at=off"),   # the daemon reads that as no number
+    ("auto_compact_at=0\n", "force_handoff_at=off"),       # it runs only with threshold compaction
+])
+def test_show_spells_out_force_handoff_at_as_the_daemon_reads_it(env, conf, shown):
+    if conf is not None:
+        (pathlib.Path(env["HOME"]) / ".claude" / "precompact.conf").write_text(conf)
+    r = run_hook("pcconf.py", "", env, ["show"])
+    assert r.returncode == 0, r.stderr
+    assert shown in r.stdout.splitlines()[-1]

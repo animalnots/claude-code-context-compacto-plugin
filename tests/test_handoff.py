@@ -1,6 +1,8 @@
 import importlib
+import json
 import os
 import pathlib
+import time
 
 import pytest
 
@@ -26,8 +28,24 @@ def stop(session=S1, prompt=P1, event="Stop", transcript=None):
     return p
 
 
+def tool_call(tool="Bash", tool_input=None, session=S1, prompt=P1, agent=None, transcript="/p/s1.jsonl"):
+    p = {"hook_event_name": "PostToolUse", "session_id": session, "prompt_id": prompt, "transcript_path": transcript,
+         "tool_name": tool, "tool_input": tool_input or {}, "tool_response": {}, "tool_use_id": "toolu_1"}
+    if agent:
+        p.update(agent_id=agent, agent_type="general-purpose")
+    return p
+
+
+def handoff_skill(**kw):
+    return tool_call("Skill", {"skill": "compact-handoff"}, **kw)
+
+
+def signals(env):
+    return pathlib.Path(env["COMPACTO_SIGNAL_DIR"])
+
+
 def state_file(env, key="7"):
-    return pathlib.Path(env["COMPACTO_SIGNAL_DIR"]) / f"{key}.handoff"
+    return signals(env) / f"{key}.handoff"
 
 
 def read_fields(env, key="7"):
@@ -152,10 +170,150 @@ def test_psmux_pane_key_carries_the_server_pid(env):
     assert read_fields(env, "4242_7")[0] == "running"
 
 
-@pytest.mark.parametrize("raw", ["", "not json", "[]", '{"hook_event_name": "Stop"}'])
+@pytest.mark.parametrize("raw", ["", "not json", "[]", '{"hook_event_name": "Stop"}',
+                                 '{"hook_event_name": "PostToolUse", "session_id": "s", "tool_name": "Skill", "tool_input": []}'])
 def test_malformed_input_never_fails_the_hook(env, raw):
     r = run_hook("handoff.py", raw, env)
     assert r.returncode == 0 and r.stdout == ""
+
+
+def test_claude_running_the_handoff_skill_itself_records_running(env):
+    r = run_hook("handoff.py", handoff_skill(), env)
+    assert r.returncode == 0 and r.stdout == ""
+    state, session, prompt, started, ended = read_fields(env)
+    assert (state, session, prompt, ended) == ("running", S1, P1, "")
+    assert started.isdigit()
+
+
+def test_the_turn_that_ran_the_handoff_skill_finishes_it(env):
+    run_hook("handoff.py", handoff_skill(), env)
+    run_hook("handoff.py", stop(), env)
+    assert read_fields(env)[0] == "done"
+
+
+def test_the_configured_handoff_runs_as_a_skill_too(env):
+    (pathlib.Path(env["HOME"]) / ".claude" / "precompact.conf").write_text("handoff_command=/my-handoff\n")
+    run_hook("handoff.py", handoff_skill(), env)
+    assert not state_file(env).exists()
+    run_hook("handoff.py", tool_call("Skill", {"skill": "my-handoff"}), env)
+    assert read_fields(env)[0] == "running"
+
+
+@pytest.mark.parametrize("call", [tool_call("Skill", {"skill": "review"}), tool_call("Bash", {"command": "compact-handoff"}),
+                                  handoff_skill(agent="a20afdcddd057fde7"), handoff_skill(prompt=None)],
+                         ids=["another skill", "another tool", "a subagent", "no prompt id"])
+def test_other_tool_calls_record_no_handoff(env, call):
+    if call["prompt_id"] is None:
+        del call["prompt_id"]
+    run_hook("handoff.py", call, env)
+    assert not state_file(env).exists()
+
+
+def test_a_second_handoff_skill_call_in_the_same_turn_keeps_its_start(env):
+    run_hook("handoff.py", handoff_skill(), env)
+    first = read_fields(env)
+    time.sleep(1.1)
+    run_hook("handoff.py", handoff_skill(), env)
+    assert read_fields(env) == first
+
+
+def test_a_handoff_start_records_the_sessions_transcript(env):
+    run_hook("handoff.py", dict(expansion(), transcript_path="/p/s1.jsonl"), env)
+    assert (signals(env) / "7.transcript").read_text() == f"{S1}\t/p/s1.jsonl\n"
+    run_hook("handoff.py", handoff_skill(session=S2, prompt=P2, transcript="/p/s2.jsonl"), env)
+    assert (signals(env) / "7.transcript").read_text() == f"{S2}\t/p/s2.jsonl\n"
+
+
+def test_outside_tmux_a_handoff_start_records_no_transcript(env):
+    del env["TMUX_PANE"]
+    run_hook("handoff.py", dict(expansion(), transcript_path="/p/s1.jsonl"), env)
+    assert not list(signals(env).glob("*.transcript"))
+
+
+def served(env, ctx, msgs=None, beat_age=0, conf=None):
+    """A pane the resume daemon watches: it exports ctx, and the daemon's heartbeat is beat_age seconds old."""
+    sig = signals(env)
+    sig.mkdir(parents=True, exist_ok=True)
+    (sig / "7.ctx").write_text(f"%7\t{ctx}\t{ctx if msgs is None else msgs}\n")
+    if beat_age is not None:
+        beat = sig / ".daemon.lock" / "heartbeat"
+        beat.parent.mkdir(exist_ok=True)
+        beat.write_text("")
+        os.utime(beat, (time.time() - beat_age, time.time() - beat_age))
+    if conf is not None:
+        (pathlib.Path(env["HOME"]) / ".claude" / "precompact.conf").write_text(conf)
+
+
+def reminder(r):
+    assert r.returncode == 0
+    if not r.stdout:
+        return None
+    out = json.loads(r.stdout)["hookSpecificOutput"]
+    assert out["hookEventName"] == "PostToolUse"
+    return out["additionalContext"]
+
+
+def test_past_force_handoff_at_claude_is_asked_to_hand_off_and_end_its_turn(env):
+    served(env, 812345)
+    text = reminder(run_hook("handoff.py", tool_call(), env))
+    assert "812k" in text and "800k" in text and "compact-handoff" in text and "end your turn" in text
+
+
+def test_under_force_handoff_at_claude_is_told_nothing(env):
+    served(env, 799999)
+    assert reminder(run_hook("handoff.py", tool_call(), env)) is None
+
+
+def test_the_reminder_comes_once_a_turn_and_again_each_50k_tokens(env):
+    served(env, 810000)
+    assert reminder(run_hook("handoff.py", tool_call(), env))
+    assert reminder(run_hook("handoff.py", tool_call(), env)) is None
+    served(env, 859999)
+    assert reminder(run_hook("handoff.py", tool_call(), env)) is None
+    served(env, 860000)
+    assert reminder(run_hook("handoff.py", tool_call(), env))
+    assert reminder(run_hook("handoff.py", tool_call(prompt=P2), env))
+
+
+def test_force_handoff_at_sets_the_point(env):
+    served(env, 500000, conf="force_handoff_at=500000\n")
+    assert "500k" in reminder(run_hook("handoff.py", tool_call(), env))
+
+
+def test_no_reminder_once_the_handoff_runs_in_this_turn(env):
+    served(env, 900000)
+    run_hook("handoff.py", handoff_skill(), env)
+    assert reminder(run_hook("handoff.py", tool_call(), env)) is None
+
+
+@pytest.mark.parametrize("named,reminded", [(S1, False), (S2, True), ("", True)],
+                         ids=["this session", "another session", "none"])
+def test_a_session_whose_handoff_never_started_gets_no_reminder(env, named, reminded):
+    served(env, 900000)
+    (signals(env) / "7.nohandoff").write_text(named + "\n")
+    assert bool(reminder(run_hook("handoff.py", tool_call(), env))) is reminded
+
+
+def test_a_handoff_left_running_by_an_earlier_turn_still_gets_the_reminder(env):
+    served(env, 900000)
+    run_hook("handoff.py", handoff_skill(prompt=P2), env)
+    assert reminder(run_hook("handoff.py", tool_call(), env))
+
+
+@pytest.mark.parametrize("why", ["force_handoff_at=0", "auto_compact_at=0", "force_handoff_at not a number", "no daemon",
+                                 "a dead daemon", "a subagent", "outside tmux", "ctx not a number", "msgs not a number",
+                                 "no prompt id"])
+def test_no_reminder_where_the_daemon_would_not_hand_off(env, why):
+    conf = {"force_handoff_at=0": "force_handoff_at=0\n", "auto_compact_at=0": "auto_compact_at=0\n",
+            "force_handoff_at not a number": "force_handoff_at=800k\n"}.get(why)
+    served(env, "900k" if why == "ctx not a number" else 900000, msgs="1k" if why == "msgs not a number" else None,
+           beat_age={"no daemon": None, "a dead daemon": 120}.get(why, 0), conf=conf)
+    call = tool_call(agent="a20afdcddd057fde7" if why == "a subagent" else None)
+    if why == "outside tmux":
+        del env["TMUX_PANE"]
+    if why == "no prompt id":
+        del call["prompt_id"]
+    assert reminder(run_hook("handoff.py", call, env)) is None
 
 
 def running(prompt=P1, session=S1):

@@ -203,7 +203,7 @@ Run the **same daemon** as auto-resume — it does all three jobs.
 
 **Claude Code's own auto compaction.** Claude Code compacts by itself mid-turn once a session nears its window (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, about 25–40k short of it), and a fork made then would miss the rest of the turn. So in a pane the daemon watches, which means auto-resume is on, threshold compaction isn't off and the pane exports its size, the hook refuses that compaction without forking and leaves `<pane>.compactwant` in the signal directory. The daemon then types `/compact` at the next idle prompt whatever the size, and the usual `/resume` follows; it counts as a compaction the daemon started. The hook does this only while the daemon's heartbeat (`.daemon.lock/heartbeat`, rewritten every poll) is under a minute old; with no daemon running it forks as before. `compactions.log` records it as `rule=daemon`, and `events.log` as `fire … asked by Claude Code`. `!` and `=` windows keep their own rules.
 
-**Opt a window out with `!`.** Put `!` anywhere in a tmux window's name (`prefix ,` or `tmux rename-window 'review!'`) and the daemon never auto-`/compact`s a pane in that window. The name is re-read every poll, so renaming the window back re-enables auto-compact within a second. Auto-resume is untouched: a `/compact` you type there yourself still compacts through the plugin, and the daemon still types its `/resume`.
+**Opt a window out with `!`.** Put `!` anywhere in a tmux window's name (`prefix ,` or `tmux rename-window 'review!'`) and the daemon never auto-`/compact`s a pane in that window. The name is re-read every poll, so renaming the window back re-enables auto-compact within a second. Auto-resume is untouched: a `/compact` you type there yourself still compacts through the plugin, and the daemon still types its `/resume`. Past `force_handoff_at` such a pane is handed off and compacted all the same, unless its handoff never starts, see [Hand off before the context limit](#autonomous-loop-auto-compact--continue--advanced-unattended).
 
 **Hand off first with `=`.** Put `=` in a window's name instead (`!` wins if both are there) and the daemon saves your work before compacting. Once a pane there reaches `min(600000, 2 × auto_compact_at)`, that is 530000 at `auto_compact_at=265000`, the daemon:
 
@@ -217,10 +217,19 @@ A turn that ends after one of these steps undoes it, and the daemon starts again
 
 A pane scrolled up in tmux copy-mode can't take keys, so it can't hand off. Once such a pane is at rest with an empty input box, the daemon scrolls it back and carries on, unless its window is on screen in any terminal. That window stays where you left it and shows `^`, and hands off once you scroll to the bottom or press `q`. tmux before 3.1 can't report who is viewing a window, so there every scrolled pane waits this way. `events.log` records `handoff-scrolled` when a scroll first holds a handoff back and `handoff-unscrolled` when the daemon scrolls a pane back.
 
+**Hand off before the context limit, in any window.** A turn that runs on without end never brings the idle prompt the rules above wait for, and at Claude Code's limit (about 975k tokens on a 1M-token model) every request is refused, a handoff's too. So once a pane's context (`ctx`, the export's first number) reaches `force_handoff_at` in `~/.claude/precompact.conf` (800000 by default, `0` turns it off), it is handed off and compacted like a `=` pane, whatever its window's name, `!` included:
+
+1. mid-turn, after each tool call, the plugin's `PostToolUse` hook tells Claude to finish the step in progress, run `/compact-handoff` and end its turn: once a turn, and again every 50k tokens more. A handoff Claude runs this way counts as one you typed;
+2. at the next idle prompt the daemon types `/compact-handoff`, unless one has just finished, and then `/compact`; the usual `/resume` follows.
+
+A session whose handoff never starts (`/compact-handoff` isn't there, say) keeps its window's own rule instead, and Claude there gets no more reminders: a plain window gets `/compact`, Claude Code's own compaction included, a `!` window is left alone, and a `=` one goes on as above. A pane where no turn has ended under the handoff hooks yet keeps its window's own rule too.
+
+A handoff refused at the limit anyway runs in a slim copy of the session, which the daemon writes beside it: the conversation up to the refused request, from Claude Code's own last compaction of it if there was one, without its thinking or images, and with tool outputs over 3000 tokens cut. The daemon resumes that copy, hands off and compacts there; the copy's first request writes all of it to the prompt cache. A copy refused too is left to you, and so is the session it was made from: the daemon logs `limit-wedged`, and `/compact` typed twice, the second time 5 seconds to 2 minutes after the first, compacts it. `events.log` records `limit-slim` when a copy is made and `limit-resume` when it's resumed. All of this runs only while threshold compaction is on (`auto_compact_at` isn't `0`). The mid-turn reminder and the slim copy need sessions started under this version's hooks; the handoff at an idle prompt works in older ones too.
+
 **Window markers: `?`, `^`, `$`, `&`.** The daemon also labels every tmux window running Claude by setting the window option `@cc_state`:
 
 - `?` a question, permission or trust dialog is waiting for you;
-- `^` a `=` window over its threshold is scrolled up, which holds its handoff back;
+- `^` a window due a handoff (a `=` one over its threshold, or any past `force_handoff_at`) is scrolled up, which holds its handoff back;
 - `$` Claude finished while you weren't viewing that window (it clears once you look);
 - `&` Claude is idle, but background agents or shells are still running, and it will wake itself when they finish.
 
@@ -253,9 +262,11 @@ COMPACTO_CONTINUE_SETTLE=3               # secs to let a resume render before ty
 COMPACTO_POLL_SECS=1                     # poll interval
 COMPACTO_HANDOFF_MAX=600000              # cap on a "=" window's threshold
 COMPACTO_HANDOFF_START_TIMEOUT=60        # secs a typed handoff may take to start before it counts as failed
+COMPACTO_LIMIT_CHECK_SECS=10             # secs between checks of whether a handoff that stalled hit the context limit
+COMPACTO_PYTHON=python                   # Python for hooks/slim_fork.py (default: python, else python3, on PATH)
 ```
 
-Config keys (in `~/.claude/precompact.conf`, read live on every poll): `auto_compact_at`, `auto_compact_metric` (`msgs` | `ctx`), `resume_continue`, `handoff_command` (default `compact-handoff`).
+Config keys (in `~/.claude/precompact.conf`, read live on every poll): `auto_compact_at`, `auto_compact_metric` (`msgs` | `ctx`), `resume_continue`, `handoff_command` (default `compact-handoff`), `force_handoff_at` (default `800000`, `0` = off).
 
 ## Windows (psmux)
 
