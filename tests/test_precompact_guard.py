@@ -148,6 +148,16 @@ def test_auto_in_a_bang_window_is_still_refused(hook):
     assert "'!' in the tmux window name opts this session out" in hook.run("auto")
 
 
+@pytest.mark.parametrize("ctx, says", [
+    (900000, "past force_handoff_at, the resume daemon hands this pane off and compacts it once the turn ends"),
+    (790000, "'!' in the tmux window name opts this session out"),
+])
+def test_auto_in_a_bang_window_past_force_handoff_at_is_left_to_the_daemon(hook, ctx, says):
+    hook.window("gloss!")
+    hook.served(ctx=ctx)
+    assert says in hook.run("auto")
+
+
 def test_manual_in_an_equals_window_needs_a_finished_handoff_or_a_repeat(hook):
     hook.window("gloss=")
     assert "compact after /compact-handoff finishes" in hook.run()
@@ -359,6 +369,21 @@ def test_a_fork_gets_the_subagent_transcripts_of_the_session_it_was_made_from(fo
     fork = re.search(r"/resume (\S+)", reason).group(1)
     carried = tmp_path / fork / "subagents" / "agent-a1b2c3d4e5f6a7b8c.jsonl"
     assert os.path.samefile(carried, tmp_path / "t" / "subagents" / "agent-a1b2c3d4e5f6a7b8c.jsonl")
+
+
+def test_a_fork_ends_the_handoff_owed_by_a_slim_copy_in_the_pane(forking, env):
+    slim = pathlib.Path(env["COMPACTO_SIGNAL_DIR"]) / f"{forking.pane_id.lstrip('%')}.slim"
+    slim.write_text("s-source\ts-copy\n")
+    assert re.search(r"/resume \S+", forking.decide("manual"))
+    assert not slim.exists()
+
+
+def test_a_blocked_compaction_leaves_the_slim_copy_owed(hook, env):
+    slim = pathlib.Path(env["COMPACTO_SIGNAL_DIR"]) / f"{hook.pane_id.lstrip('%')}.slim"
+    slim.write_text("s-source\ts-copy\n")
+    hook.window("gloss=")
+    assert "compact after /compact-handoff finishes" in hook.run()
+    assert slim.exists()
 
 
 def test_a_fork_whose_subagent_files_cannot_be_carried_is_still_written(forking, tmp_path):

@@ -169,10 +169,6 @@ SIGNAL_DIR = pathlib.Path(
     os.environ.get("COMPACTO_SIGNAL_DIR")
     or pathlib.Path.home() / ".claude" / "compacto-signals"
 )
-# The resume daemon rewrites this every poll. Daemons from before 1.5.16 don't, and they would never
-# run a compaction left to them, so only a fresh one counts as a daemon that will.
-DAEMON_HEARTBEAT = SIGNAL_DIR / ".daemon.lock" / "heartbeat"
-DAEMON_HEARTBEAT_MAX_AGE = 60
 
 cwd_dir = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
 out_dir = pathlib.Path(cwd_dir) / ".claude" / "summaries"
@@ -223,23 +219,14 @@ def _context_tokens(e):
                                         "cache_read_input_tokens"))
 
 
-def _last_context_tokens(path, tail_bytes=4 << 20, sidechain=False):
+def _last_context_tokens(path, sidechain=False):
     # Tail first: a refused auto compaction repeats on every turn of a big session.
     # A subagent's own transcript has only isSidechain entries, so `sidechain` reads those too.
-    with open(path, "rb") as f:
-        size = f.seek(0, os.SEEK_END)
-        for start in ([size - tail_bytes, 0] if size > tail_bytes else [0]):
-            f.seek(start)
-            lines = f.read().splitlines()[1 if start else 0:]
-            for raw in reversed(lines):
-                try:
-                    e = json.loads(raw)
-                except ValueError:
-                    continue
-                if (isinstance(e, dict) and e.get("type") == "assistant"
-                        and (sidechain or not e.get("isSidechain")) and _context_tokens(e)):
-                    return _context_tokens(e)
-    return 0
+    if rewrite_transcript is None:
+        return 0
+    e = rewrite_transcript.last_entry(path, lambda e: e.get("type") == "assistant"
+                                      and (sidechain or not e.get("isSidechain")) and _context_tokens(e) > 0)
+    return _context_tokens(e) if e else 0
 
 
 def _newest_subagent(parent_path):
@@ -314,38 +301,16 @@ def _pane_key():
     return f"{PSMUX_SERVER}_{key}" if PSMUX_SERVER else key
 
 
-def _daemon_threshold_on():
-    # Read as the daemon's conf_get reads it, without stripping spaces or a CR, so that wherever the two
-    # could differ the hook takes it as off and forks as before, rather than leave a compaction nobody runs.
-    try:
-        text = PCCONF.read_bytes().decode("utf-8")
-    except FileNotFoundError:
-        text = ""
-    except (OSError, ValueError):
-        return False
-    values = [ln[len("auto_compact_at="):] for ln in text.split("\n") if ln.startswith("auto_compact_at=")]
-    at = values[-1] if values else ""
-    return at == "" or (re.fullmatch(r"[0-9]+", at) is not None and int(at) > 0)
-
-
 def _size_if_daemon_compacts_at_idle():
     """This pane's exported context size when the resume daemon will /compact it at its next idle prompt, else
     None. That takes a running daemon, auto-resume on, threshold compaction not off, and the pane's size export,
     since the daemon only watches panes that export their size."""
-    if not (AUTO_RESUME and TMUX_PANE and handoff is not None and _daemon_threshold_on()):
+    if not (AUTO_RESUME and TMUX_PANE and handoff is not None and handoff.daemon_threshold_on()
+            and handoff.daemon_alive()):
         return None
-    try:
-        if time.time() - DAEMON_HEARTBEAT.stat().st_mtime > DAEMON_HEARTBEAT_MAX_AGE:
-            return None
-        line = (SIGNAL_DIR / f"{_pane_key()}.ctx").read_bytes().decode("utf-8").split("\n")[0]
-    except (OSError, ValueError):
-        return None
-    # Read as the daemon reads it, only a trailing CR stripped. Both numbers must be plain: the daemon skips a pane
-    # whose metric (msgs by default) isn't one. A size of 0 is a session that hasn't reported its size yet.
-    sizes = [f[:-1] if f.endswith("\r") else f for f in line.split("\t")[1:3]]
-    if len(sizes) < 2 or not all(re.fullmatch(r"[0-9]+", s) for s in sizes) or int(sizes[0]) == 0:
-        return None
-    return int(sizes[0])
+    sizes = handoff.pane_sizes(_pane_key())
+    # A size of 0 is a session that hasn't reported its size yet.
+    return sizes[0] if sizes and sizes[0] else None
 
 
 def _ledger(fields):
@@ -389,8 +354,10 @@ window_name = _window_name()
 # Claude Code's own auto compaction there too, without forking or arming /resume.
 if trigger == "auto" and "!" in window_name:
     _log_auto("refuse", "bang-window")
-    print(json.dumps({"decision": "block",
-                      "reason": "precompact: '!' in the tmux window name opts this session out of auto-compaction"}))
+    forced = handoff is not None and handoff.past_force_handoff_at(_pane_key())
+    print(json.dumps({"decision": "block", "reason": (
+        "precompact: past force_handoff_at, the resume daemon hands this pane off and compacts it once the turn ends"
+        if forced else "precompact: '!' in the tmux window name opts this session out of auto-compaction")}))
     sys.exit(0)
 if handoff is not None:
     handoff_block = handoff.check_compaction(session_id, trigger, window_name)
@@ -744,6 +711,14 @@ elif summary is None:
 # distinction took hours of preview-directory archaeology to reconstruct after the fact;
 # now it's one grep.
 _ledger(f"msgs={N} fork={fork_id or f'FAILED({fork_error})'}")
+
+# Any compaction in this pane, the daemon's or one you typed, settles the handoff and /compact owed to a slim
+# copy made at the context limit, so the daemon mustn't run them again on this fork.
+if fork_id and TMUX_PANE:
+    try:
+        (SIGNAL_DIR / f"{_pane_key()}.slim").unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # ---- 9b. Arm auto-resume (opt-in, tmux-only) -----------------------------
