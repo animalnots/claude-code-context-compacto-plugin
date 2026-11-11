@@ -286,6 +286,14 @@ def test_no_reminder_once_the_handoff_runs_in_this_turn(env):
     assert reminder(run_hook("handoff.py", tool_call(), env)) is None
 
 
+@pytest.mark.parametrize("named,reminded", [(S1, False), (S2, True), ("", True)],
+                         ids=["this session", "another session", "none"])
+def test_a_session_whose_handoff_never_started_gets_no_reminder(env, named, reminded):
+    served(env, 900000)
+    (signals(env) / "7.nohandoff").write_text(named + "\n")
+    assert bool(reminder(run_hook("handoff.py", tool_call(), env))) is reminded
+
+
 def test_a_handoff_left_running_by_an_earlier_turn_still_gets_the_reminder(env):
     served(env, 900000)
     run_hook("handoff.py", handoff_skill(prompt=P2), env)

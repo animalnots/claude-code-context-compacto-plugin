@@ -18,8 +18,9 @@ Beyond selecting the head/tail windows by token budget, this also:
   - strips `message.usage` (cached API token counts) and `toolUseResult` metadata
   - reassigns every UUID so Claude Code can't re-hydrate the fork from other session files
 
-`slim()` writes the other kind of fork: a session stuck at the context limit, whole up to its last
-request but without thinking or images, and with long tool outputs capped, so a turn fits again.
+`slim()` writes the other kind of fork: of a session stuck at the context limit, the conversation since Claude
+Code's last compaction of it, up to its last request, without thinking or images and with long tool outputs
+capped, so a turn fits again.
 
 Defaults (when no env / config is set): head_tokens=0, tail_tokens=25000.
 Both can be overridden via env:
@@ -185,8 +186,7 @@ def _source_title(entries: List[Dict]) -> Optional[str]:
 
 
 def _conversation(entries: List[Dict]) -> List[Dict]:
-    # Dedupe by UUID and drop pure command-stdout wrappers up front so window
-    # selection sees the same set of entries that will actually be preserved.
+    # rewrite() picks its head and tail windows from this list, so it must hold exactly the messages its fork keeps.
     seen = set()
     convo = []
     for e in entries:
@@ -701,13 +701,30 @@ def _closing_reply(template: Dict, parent_uuid: str, new_id: str, now_iso: str) 
     }
 
 
+def _loaded_chain(entries: List[Dict], leaf: Dict) -> set:
+    """The uuids on Claude Code's parentUuid walk back from leaf when it resumes there. The walk stops at the
+    boundary of the last compaction Claude Code ran itself, or at a parent missing from the file."""
+    by_uuid = {}
+    for e in entries:
+        if e.get("uuid"):
+            by_uuid.setdefault(e["uuid"], e)
+    chain, e = set(), leaf
+    while e is not None and e.get("uuid") not in chain:
+        if e.get("type") == "system" and e.get("subtype") == "compact_boundary":
+            break
+        chain.add(e.get("uuid"))
+        e = by_uuid.get(e.get("parentUuid"))
+    return chain
+
+
 def slim(orig_path: str, projects_dir: str = None) -> str:
     """Writes a slim copy of a session at the context limit to <projects_dir>/<new_id>.jsonl, returns new_id.
 
-    The copy keeps the conversation up to the session's last request, whole but for its thinking and images,
-    with tool outputs capped at MAX_BLOCK_TOKENS. The requests the limit refused after that, and the prompts
-    they carried, are left out. A closing reply follows a last tool result, so the next prompt opens a turn of
-    its own instead of carrying on a tool call whose thinking is gone.
+    The copy keeps the messages on the session's chain up to its last request, back to the summary of the last
+    compaction Claude Code ran itself if there was one, without their thinking and images, and with tool outputs
+    capped at MAX_BLOCK_TOKENS. The requests the limit refused after that, and the prompts they carried, are left
+    out. A closing reply follows a last tool result, so the next prompt opens a turn of its own instead of carrying
+    on a tool call whose thinking is gone.
     Raises ValueError when no such request is left to keep.
     """
     if projects_dir is None:
@@ -718,7 +735,7 @@ def slim(orig_path: str, projects_dir: str = None) -> str:
     if end is None:
         raise ValueError("no request in the session to keep")
     last = convo[end]
-    keep = {e.get("uuid") for e in convo[:end + 1]}
+    keep = {e.get("uuid") for e in convo[:end + 1]} & _loaded_chain(entries, last)
     cut = next(i for i, e in enumerate(entries) if e is last)
     template = next((e for e in reversed(convo[:end + 1])
                      if e.get("type") == "assistant" and not e.get("isApiErrorMessage")), last)

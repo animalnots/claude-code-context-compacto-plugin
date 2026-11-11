@@ -158,6 +158,17 @@ def test_auto_in_a_bang_window_past_force_handoff_at_is_left_to_the_daemon(hook,
     assert says in hook.run("auto")
 
 
+@pytest.mark.parametrize("named, says", [
+    (S1, "'!' in the tmux window name opts this session out"),
+    ("22222222-aaaa-4bbb-8ccc-000000000002", "past force_handoff_at, the resume daemon hands this pane off"),
+], ids=["this session", "another session"])
+def test_auto_in_a_bang_window_after_a_handoff_that_never_started_is_refused_as_opted_out(hook, env, named, says):
+    hook.window("gloss!")
+    hook.served(ctx=900000)
+    (pathlib.Path(env["COMPACTO_SIGNAL_DIR"]) / f"{hook.pane_id.lstrip('%')}.nohandoff").write_text(named + "\n")
+    assert says in hook.run("auto")
+
+
 def test_manual_in_an_equals_window_needs_a_finished_handoff_or_a_repeat(hook):
     hook.window("gloss=")
     assert "compact after /compact-handoff finishes" in hook.run()

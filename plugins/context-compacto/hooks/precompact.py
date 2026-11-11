@@ -354,7 +354,7 @@ window_name = _window_name()
 # Claude Code's own auto compaction there too, without forking or arming /resume.
 if trigger == "auto" and "!" in window_name:
     _log_auto("refuse", "bang-window")
-    forced = handoff is not None and handoff.past_force_handoff_at(_pane_key())
+    forced = handoff is not None and handoff.past_force_handoff_at(_pane_key(), session_id)
     print(json.dumps({"decision": "block", "reason": (
         "precompact: past force_handoff_at, the resume daemon hands this pane off and compacts it once the turn ends"
         if forced else "precompact: '!' in the tmux window name opts this session out of auto-compaction")}))

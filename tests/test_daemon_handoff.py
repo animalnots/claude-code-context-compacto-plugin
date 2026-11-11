@@ -140,6 +140,12 @@ class Rig:
         p = self.signals / "events.log"
         return p.read_text() if p.exists() else ""
 
+    def wait_log(self, text, timeout=15):
+        end = time.time() + timeout
+        while text not in self.daemon_log() and time.time() < end:
+            time.sleep(0.2)
+        assert text in self.daemon_log()
+
     def wait_for(self, prefix, timeout=20):
         end = time.time() + timeout
         while time.time() < end:
@@ -727,6 +733,73 @@ def test_with_force_handoff_at_off_windows_keep_their_own_rules(rig, window, fir
     rig.start(window, 300000, context=900000)
     time.sleep(4)
     assert rig.typed()[:1] == ([first] if first else [])
+
+
+@pytest.mark.parametrize("window,compacts", [("gloss", True), ("gloss!", False), ("gloss=", False)],
+                         ids=["plain window", "opted out", "equals window"])
+def test_past_force_handoff_at_a_handoff_that_never_starts_leaves_the_pane_to_its_windows_rule(rig, window, compacts):
+    rig.start(window, 900000, handoff="ignore")
+    if compacts:
+        typed = rig.wait_typed(3)
+        assert typed[:2] == ["/compact-handoff", "/compact"] and typed[2].startswith("/resume ")
+    else:
+        rig.wait_log("never started")
+        time.sleep(3)
+        assert rig.typed() == ["/compact-handoff"]
+    assert "never started" in rig.daemon_log()
+
+
+def test_past_force_handoff_at_claude_codes_own_compaction_runs_when_the_handoff_never_starts(rig):
+    rig.start("gloss", 100000, context=900000, handoff="ignore", daemon=False)
+    rig.want(900000)
+    rig.start_daemon()
+    typed = rig.wait_typed(3)
+    assert typed[:2] == ["/compact-handoff", "/compact"] and typed[2].startswith("/resume ")
+    assert ", asked by Claude Code" in rig.daemon_log()
+
+
+def test_a_session_whose_handoff_never_started_is_not_reminded_or_forced_again(rig):
+    rig.env["COMPACTO_COMPACT_COOLDOWN"] = "1"
+    rig.start("gloss!", 300000, context=900000, handoff="ignore")
+    rig.wait_log("never started")
+    rig.keys("toolturn", "Enter")
+    rig.wait_for("IDLE")
+    rig.keys("turn", "Enter")
+    rig.wait_for("AUTO_COMPACT_BLOCKED")
+    time.sleep(4)
+    assert rig.typed() == ["/compact-handoff", "toolturn", "turn"]
+    assert not [e for e in rig.events() if e.startswith("REMINDED")]
+    assert "AUTO_COMPACT_BLOCKED precompact: '!' in the tmux window name opts this session out of auto-compaction" \
+        in rig.events()
+
+
+def test_a_handoff_that_never_started_in_another_session_does_not_count(rig):
+    rig.start("gloss!", 300000, context=900000, daemon=False)
+    rig.signal("nohandoff").write_text(f"{uuid.uuid4()}\n")
+    rig.start_daemon()
+    typed = rig.wait_typed(3)
+    assert typed[:2] == ["/compact-handoff", "/compact"] and typed[2].startswith("/resume ")
+
+
+def test_past_force_handoff_at_a_session_without_the_hooks_keeps_its_windows_rule(rig):
+    rig.start("gloss", 900000, hooked=False)
+    typed = rig.wait_typed(2, timeout=15)
+    assert typed[:1] == ["/compact"] and typed[1].startswith("/resume ")
+
+
+@pytest.mark.parametrize("runs,owed", [("its source", True), ("the copy", True), ("another session", False)])
+def test_a_slim_copy_is_handed_off_only_while_the_pane_runs_it_or_its_source(rig, runs, owed):
+    rig.start("gloss!", 1000, daemon=False)
+    current = rig.signal("hooked").read_text().split("\n")[0]
+    other, copy = str(uuid.uuid4()), str(uuid.uuid4())
+    source, copy = {"its source": (current, copy), "the copy": (other, current), "another session": (other, copy)}[runs]
+    rig.signal("slim").write_text(f"{source}\t{copy}\n")
+    rig.start_daemon()
+    if owed:
+        assert rig.wait_typed(2)[:2] == ["/compact-handoff", "/compact"]
+    else:
+        time.sleep(4)
+        assert rig.typed() == [] and rig.signal("slim").exists()
 
 
 def test_a_handoff_typed_by_hand_is_not_doubled_while_its_turn_ends(rig):

@@ -152,6 +152,72 @@ def test_the_copy_is_a_session_of_its_own_whose_chain_reaches_every_message(tmp_
     assert walked == len(messages(rows))
 
 
+def native_compaction(tag, before):
+    """What a compaction Claude Code ran itself leaves: a boundary, and the summary the talk after it carries on from."""
+    return [{"type": "system", "subtype": "compact_boundary", "uuid": f"b-{tag}", "parentUuid": None,
+             "logicalParentUuid": before, "isSidechain": False, "sessionId": SESSION, "content": "Conversation compacted",
+             "compactMetadata": {"trigger": "auto", "preTokens": 900000}},
+            entry("user", f"s-{tag}", f"b-{tag}", f"summary {tag}", isCompactSummary=True, isVisibleInTranscriptOnly=True)]
+
+
+def after_compactions(*tags):
+    """conversation(), after a stretch of talk and a native compaction for each tag."""
+    rows, parent = [], None
+    for tag in tags:
+        rows += [entry("user", f"q-{tag}", parent, f"old question {tag}"),
+                 entry("assistant", f"w-{tag}", f"q-{tag}", [{"type": "text", "text": f"old answer {tag}"}])]
+        rows += native_compaction(tag, f"w-{tag}")
+        parent = f"s-{tag}"
+    convo = conversation()
+    return convo[:1] + rows + [dict(convo[1], parentUuid=parent)] + convo[2:]
+
+
+def copy_texts(tmp_path, rows):
+    """The copy's messages, as their text or their first block's type, in chain order from its last message."""
+    copy = fork_rows(tmp_path, rewrite_transcript.slim(str(write(tmp_path, rows))))
+    by_uuid = {r["uuid"]: r for r in copy if r.get("uuid")}
+    chain, cur = [], messages(copy)[-1]
+    while cur is not None:
+        c = cur["message"]["content"]
+        chain.append(c if isinstance(c, str) else c[0].get("text") or c[0]["type"])
+        cur = by_uuid.get(cur.get("parentUuid"))
+    assert len(chain) == len(messages(copy))
+    return chain[::-1]
+
+
+AFTER_THE_SUMMARY = ["build the pill", "tool_use", "tool_result", "looking at it", "tool_use", "tool_result",
+                     rewrite_transcript.SLIM_NOTE.format(cap=rewrite_transcript.MAX_BLOCK_TOKENS)]
+
+
+def test_the_copy_starts_at_the_summary_of_a_compaction_claude_code_ran(tmp_path):
+    assert copy_texts(tmp_path, after_compactions("A")) == ["summary A"] + AFTER_THE_SUMMARY
+
+
+def test_after_several_compactions_the_copy_starts_at_the_last_summary(tmp_path):
+    assert copy_texts(tmp_path, after_compactions("A", "B", "C")) == ["summary C"] + AFTER_THE_SUMMARY
+
+
+def test_a_boundary_no_summary_follows_is_passed_by(tmp_path):
+    orphan = native_compaction("X", "a2")[0]
+    rows = after_compactions("A")
+    assert copy_texts(tmp_path, rows[:-3] + [orphan] + rows[-3:]) == ["summary A"] + AFTER_THE_SUMMARY
+    assert copy_texts(tmp_path, conversation()[:3] + [orphan] + conversation()[3:]) == AFTER_THE_SUMMARY
+
+
+def test_without_a_compaction_the_walk_passes_attachments_and_system_entries(tmp_path):
+    rows = conversation()
+    i = rows.index(next(r for r in rows if r.get("uuid") == "a4"))
+    rows[i - 1] = dict(rows[i - 1], parentUuid="at1")
+    rows[i:i + 1] = [{"type": "system", "subtype": "turn_duration", "uuid": "sy1", "parentUuid": "a3",
+                      "isSidechain": False, "sessionId": SESSION}, dict(rows[i], parentUuid="sy1")]
+    assert copy_texts(tmp_path, rows) == AFTER_THE_SUMMARY
+
+
+def test_the_copy_stops_where_a_parent_is_missing_from_the_session(tmp_path):
+    rows = [dict(r, parentUuid="gone") if r.get("uuid") == "a3" else r for r in conversation()]
+    assert copy_texts(tmp_path, rows) == AFTER_THE_SUMMARY[3:]
+
+
 def test_the_copy_is_titled_as_a_slim_copy_and_a_later_compaction_does_not_stack_titles(tmp_path, stuck):
     rows = fork_rows(tmp_path, rewrite_transcript.slim(str(stuck)))
     title = [r["customTitle"] for r in rows if r.get("type") == "custom-title"]

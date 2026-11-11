@@ -35,8 +35,10 @@
 #      unless its window is on screen: that one waits for you and shows "^" (behavior 4).
 #      Past force_handoff_at=<context tokens> (default 800000, 0 = off) a pane hands off and compacts
 #      the same way whatever its window's name, "!" included, and hooks/handoff.py asks Claude mid-turn
-#      to hand off and end its turn. A handoff whose request is refused at the context limit runs in a
-#      slim copy of the session instead (hooks/slim_fork.py): this resumes the copy and hands off there.
+#      to hand off and end its turn. A session whose handoff never started, or a pane where no turn has
+#      ended under the handoff hooks yet, keeps its window's own rule. A handoff whose request is refused
+#      at the context limit runs in a slim copy of the session instead (hooks/slim_fork.py): this resumes
+#      the copy and hands off there.
 #
 #   3. POST-RESUME CONTINUE (resume_continue=<message>): after an auto-triggered
 #      compaction resumes, types <message> (e.g. "continue") so the task keeps
@@ -285,13 +287,25 @@ handoff_window() { [[ "$1" == *'='* && "$1" != *'!'* ]]; }
 # and so does one resumed into a slim copy made at the context limit, until that copy is compacted.
 over_force_limit() { [ "$FORCE" -gt 0 ] && is_num "${1:-}" && [ "$1" -ge "$FORCE" ]; }
 # <key>.slim is "source session<TAB>slim copy", and a third field once the copy was refused at the limit too.
+# It holds while the pane's last Stop was in either one: the source's, until a turn ends in the resumed copy.
 slim_pending() {
-    local wedged=""
+    local src="" copy="" wedged="" cur=""
     [ -e "$SIGNAL_DIR/$1.slim" ] || return 1
-    IFS=$'\t' read -r _ _ wedged < "$SIGNAL_DIR/$1.slim"
-    [ -z "${wedged%$'\r'}" ]
+    IFS=$'\t' read -r src copy wedged < "$SIGNAL_DIR/$1.slim"
+    [ -e "$SIGNAL_DIR/$1.hooked" ] && IFS= read -r cur < "$SIGNAL_DIR/$1.hooked"
+    cur="${cur%$'\r'}"
+    [ -z "${wedged%$'\r'}" ] && [ -n "$cur" ] && { [ "$cur" = "$src" ] || [ "$cur" = "${copy%$'\r'}" ]; }
 }
-force_due() { slim_pending "$1" || over_force_limit "${2:-}"; }
+# A pane is forced only once a turn has ended there under the handoff hooks, and never for a session whose
+# handoff never started (<key>.nohandoff names it): those keep their window's own rule.
+can_force() {
+    local cur="" none=""
+    [ -e "$SIGNAL_DIR/$1.hooked" ] && IFS= read -r cur < "$SIGNAL_DIR/$1.hooked"
+    [ -e "$SIGNAL_DIR/$1.nohandoff" ] && IFS= read -r none < "$SIGNAL_DIR/$1.nohandoff"
+    cur="${cur%$'\r'}"
+    [ -n "$cur" ] && [ "$cur" != "${none%$'\r'}" ]
+}
+force_due() { can_force "$1" && { slim_pending "$1" || over_force_limit "${2:-}"; }; }
 # handoff.py lets a /compact run in a "=" window once the handoff of the pane's current session has finished.
 # This daemon types one only while nothing has run since: the last Stop is the handoff's own (.hooked's
 # second line; hooks from before that line can't tell), and no fork it led to was dropped as stale.
@@ -436,7 +450,7 @@ unscroll_for_handoff() {
 # variables set. hooks/handoff.py writes $key.handoff ("state session prompt started ended") and, at every
 # Stop, $key.hooked; $hs marks a handoff this daemon typed.
 handoff_step() {
-    local st="" sess="" prompt="" started="" ended="" hooked="$SIGNAL_DIR/$key.hooked" n="${cpane#%}"
+    local st="" sess="" prompt="" started="" ended="" cur="" hooked="$SIGNAL_DIR/$key.hooked" n="${cpane#%}"
     if [ ! -e "$hooked" ]; then
         if [ -z "${HANDOFF_UNHOOKED[$n]:-}" ]; then
             HANDOFF_UNHOOKED[$n]=1
@@ -460,6 +474,8 @@ handoff_step() {
             # idleness tells. One that was merely queued is adopted below once it finishes.
             if [ "$(file_age "$hs")" -ge "$HANDOFF_START_TIMEOUT" ] && pane_idle "$ctgt"; then
                 HANDOFF_STALE[$n]="$(file_mtime "$hooked")"
+                # So that session isn't forced to hand off again, nor asked to by handoff.py.
+                IFS= read -r cur < "$hooked"; printf '%s\n' "${cur%$'\r'}" > "$SIGNAL_DIR/$key.nohandoff"
                 handoff_failed "never started (Claude there predates the handoff hooks, or handoff_command names no command)"
             fi
             return 0
@@ -517,9 +533,8 @@ handoff_at_limit() {
     [ "$tsess" = "$1" ] && [ -f "$tpath" ] || return 1
     "$PYTHON" "$HOOKS_DIR/slim_fork.py" at-limit "$tpath" "$2"
 }
-# No turn runs in a session at the context limit, so the handoff runs in a slim copy of session $1 instead: the
-# same conversation without its thinking or images, and with long tool outputs capped (slim_fork.py make). If the
-# copy is refused too, the pane is left to you: compacting it without a handoff is what this is here to avoid.
+# No turn runs in a session at the context limit, so the handoff runs in a slim copy of session $1 (slim_fork.py
+# make). A copy refused too is left to you: compacting it without a handoff is what this avoids.
 limit_recover() {
     local src="" fork="" tsess="" tpath="" n="${cpane#%}"
     pane_box_empty "$ctgt" || return 0
@@ -674,7 +689,8 @@ while true; do
             if [ "$rc" = 1 ]; then                  # session closed -> clean up its files
                 rm -f "$cf" "$SIGNAL_DIR/$key.compacting" "$SIGNAL_DIR/$key.await-continue" "$SIGNAL_DIR/$key.lastauto" "$SIGNAL_DIR/$key.belowsince" "$SIGNAL_DIR/$key.resumewant" "$SIGNAL_DIR/$key.failcount" \
                       "$SIGNAL_DIR/$key.handoffsent" "$SIGNAL_DIR/$key.handoff" "$SIGNAL_DIR/$key.hooked" "$SIGNAL_DIR/$key.guard" "$SIGNAL_DIR/$key.compactwant" \
-                      "$SIGNAL_DIR/$key.handoffspent" "$SIGNAL_DIR/$key.slim" "$SIGNAL_DIR/$key.transcript" "$SIGNAL_DIR/$key.forcenote"
+                      "$SIGNAL_DIR/$key.handoffspent" "$SIGNAL_DIR/$key.slim" "$SIGNAL_DIR/$key.transcript" "$SIGNAL_DIR/$key.forcenote" \
+                      "$SIGNAL_DIR/$key.nohandoff"
                 unset "HANDOFF_REDO[${cpane#%}]"
                 continue
             fi
@@ -702,8 +718,8 @@ while true; do
                 if is_num "$wsize" && is_num "${cctx:-}" && [ "$cctx" -ge "$wsize" ]; then want=1; else rm -f "$cw"; fi
             fi
             forced=0; why="$METRIC=$val >= $HTHRESH"
-            if slim_pending "$key"; then forced=1; why="the slim copy made at the context limit"
-            elif over_force_limit "${cctx:-}"; then forced=1; why="ctx=$cctx >= force_handoff_at $FORCE"; fi
+            if slim_pending "$key" && can_force "$key"; then forced=1; why="the slim copy made at the context limit"
+            elif over_force_limit "${cctx:-}" && can_force "$key"; then forced=1; why="ctx=$cctx >= force_handoff_at $FORCE"; fi
             evnote=""; [ "$forced" = 1 ] && evnote=" forced ($why)"
             # The window name sets the threshold, so read it once the pane could be over either one.
             wname=""; handoff=0; pthresh="$THRESH"
@@ -711,11 +727,13 @@ while true; do
                 wname="$($TMUX_CMD display-message -p -t "$ctgt" '#{window_name}' 2>/dev/null)"
                 handoff_window "$wname" && { handoff=1; pthresh="$HTHRESH"; }
             fi
-            [ "$forced" = 1 ] && handoff=1
             over=0; { [ "$forced" = 1 ] || [ "$val" -ge "$pthresh" ]; } && over=1
             # "=" and "!" windows compact by their own rules; a "=" one takes a /compact once its handoff is done.
             if [ "$want" = 1 ] && [ "$handoff" = 1 ] && handoff_usable "$key"; then handoff=0; fi
             if [ "$want" = 1 ] && { [ "$handoff" = 1 ] || [[ "$wname" == *'!'* ]]; }; then want=0; rm -f "$cw"; fi
+            # Only after those, so a plain window keeps the compaction Claude Code asked for, in case its handoff
+            # never starts.
+            [ "$forced" = 1 ] && handoff=1
             # A typed handoff is dropped once its window loses the "=" or its size falls (compacted
             # some other way), so a later crossing starts a fresh one.
             if [ -e "$hs" ] && ! { [ "$handoff" = 1 ] && [ "$over" = 1 ]; }; then rm -f "$hs"; fi

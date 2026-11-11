@@ -25,6 +25,8 @@ Past force_handoff_at, the daemon hands off and compacts a pane whatever its win
 at an idle prompt. So on PostToolUse in a pane it watches, once the pane's exported context reaches
 that size, this tells Claude to hand off and end the turn: once a turn, and again each REMIND_STEP
 tokens more. <key>.forcenote holds the last such reminder, "session_id<TAB>prompt_id<TAB>context".
+A session whose handoff never started, which the daemon names in <key>.nohandoff, keeps its window's
+own rule and is told nothing.
 
 Config (~/.claude/precompact.conf): handoff_command=<skill or command> (default compact-handoff),
 force_handoff_at=<context tokens> (default 800000, 0 = off). The hook always exits 0 and prints
@@ -183,17 +185,25 @@ def read_note(key):
         return None
 
 
-def past_force_handoff_at(key):
+def handoff_never_started(key, session_id):
+    try:
+        return (signal_dir() / f"{key}.nohandoff").read_text(encoding="utf-8").strip() == session_id
+    except (OSError, ValueError):
+        return False
+
+
+def past_force_handoff_at(key, session_id):
     """(context, force_handoff_at) while the daemon would hand this pane off and compact it at its next idle
     prompt whatever its window's name, else None."""
     at = force_handoff_at() if pane_key() else 0
     sizes = pane_sizes(key) if at else None
-    return (sizes[0], at) if sizes and sizes[0] >= at and daemon_alive() else None
+    return (sizes[0], at) if (sizes and sizes[0] >= at and daemon_alive()
+                              and not handoff_never_started(key, session_id)) else None
 
 
 def handoff_reminder(key, session_id, prompt):
     """What to tell Claude when this turn should hand off now, or None."""
-    due = past_force_handoff_at(key) if prompt else None
+    due = past_force_handoff_at(key, session_id) if prompt else None
     if not due:
         return None
     ctx, at = due
