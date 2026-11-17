@@ -95,6 +95,7 @@ SETTLE="${COMPACTO_CONTINUE_SETTLE:-3}"
 # a stuck pane degrades to a slow retry, never a storm. Stamped on both /compact and
 # /resume, so a fresh fork gets time to render its low size before it's eligible again.
 MIN_INTERVAL="${COMPACTO_MIN_COMPACT_INTERVAL:-30}"
+LEFTOVER_GRACE=30
 # Seconds a pane must stay CONFIRMED below the threshold before .compacting re-arms. This
 # is what makes the debounce honest: a /compact isn't "done" when we type /resume (the
 # resume can fail to switch a busy autonomous pane), it's done when the size actually and
@@ -129,6 +130,8 @@ CONF="$HOME/.claude/precompact.conf"
 
 command -v ${TMUX_CMD%% *} >/dev/null 2>&1 || { echo "compacto-resume-daemon: '${TMUX_CMD%% *}' not found on PATH" >&2; exit 1; }
 ON_PSMUX=0; $TMUX_CMD -V 2>/dev/null | grep -qi psmux && ON_PSMUX=1
+# The input box is read with its attributes, to tell faint text from typed. psmux's -e is untested.
+BOX_ATTRS="-e"; [ "$ON_PSMUX" = 1 ] && BOX_ATTRS=""
 mkdir -p "$SIGNAL_DIR"
 # Command line of pid $1: /proc where it exists (Linux; Git Bash, whose ps has no -o), else ps (macOS).
 proc_cmdline() { if [ -r "/proc/$1/cmdline" ]; then tr '\0' ' ' < "/proc/$1/cmdline"; else ps -p "$1" -o command= 2>/dev/null; fi; }
@@ -254,32 +257,117 @@ pane_pending_compact() {
 # on screen. Same box test as classify. Read as bytes in the C locale: the box starts with "❯"
 # and a no-break space, and awks disagree on Unicode outside it.
 IFS= read -r -d '' BOX_AWK <<'AWK'
-BEGIN { nbsp = sprintf("%c%c", 194, 160) }
-{ line[++n] = $0 }
+BEGIN { nbsp = sprintf("%c%c", 194, 160); esc = sprintf("%c", 27); bel = sprintf("%c", 7) }
+# The line without its escapes or the cells they draw faint: Claude Code draws its placeholder and the prompt it
+# suggests faint, and a box holding only those is empty. As tmux writes it, faint lasts into the next line until
+# an escape ends it. The box itself is found in drawn, the line with every cell, as classify finds it.
+function plain(s,    out, i, j, c, n, p, k) {
+    out = drawn = ""
+    while ((i = index(s, esc)) > 0) {
+        if (!faint) out = out substr(s, 1, i - 1)
+        drawn = drawn substr(s, 1, i - 1)
+        c = substr(s, i + 1, 1); s = substr(s, i + 2)
+        if (c == "]") {                                     # a hyperlink, ended by BEL or ESC \
+            j = index(s, bel); k = index(s, esc "\\")
+            if (j && (!k || j < k)) s = substr(s, j + 1); else s = k ? substr(s, k + 2) : ""
+        } else if (c == "[" && match(s, /[@-~]/)) {
+            if (substr(s, RSTART, 1) == "m") {
+                n = split(substr(s, 1, RSTART - 1), p, ";")
+                if (!n) faint = 0
+                # 38, 48 and 58 take a colour: 5;N or 2;R;G;B, whose numbers aren't attributes.
+                for (k = 1; k <= n; k++)
+                    if (p[k] == "" || p[k] == "0" || p[k] == "22") faint = 0
+                    else if (p[k] == "2") faint = 1
+                    else if (p[k] ~ /^[345]8$/) k += (p[k + 1] == "5") ? 2 : ((p[k + 1] == "2") ? 4 : 0)
+            }
+            s = substr(s, RSTART + 1)
+        }
+    }
+    drawn = drawn s
+    return faint ? out : out s
+}
+{ line[++n] = plain($0); cells[n] = drawn }
 END {
-    for (i = 2; i <= n; i++) if (line[i] ~ /^❯/) box = (line[i - 1] ~ /^───/ && line[i] !~ /^❯ [0-9]+\. /) ? i : 0
+    for (i = 2; i <= n; i++) if (cells[i] ~ /^❯/) box = (cells[i - 1] ~ /^───/ && cells[i] !~ /^❯ [0-9]+\. /) ? i : 0
     if (!box) exit 1
-    text = substr(line[box], 4)
+    text = line[box]; sub(/^❯/, "", text)
     if (index(text, nbsp) == 1) text = substr(text, 3)
-    for (i = box + 1; i <= n && line[i] !~ /^───/; i++) text = text "\n" line[i]
+    for (i = box + 1; i <= n && cells[i] !~ /^───/; i++) text = text "\n" line[i]
     sub(/[ \n]+$/, "", text)
     printf "%s", text
 }
 AWK
-pane_box_text()  { $TMUX_CMD capture-pane -p -t "$1" 2>/dev/null | LC_ALL=C awk "$BOX_AWK"; }
+pane_box_text()  { $TMUX_CMD capture-pane -p $BOX_ATTRS -t "$1" 2>/dev/null | LC_ALL=C awk "$BOX_AWK"; }
 pane_box_empty() { local t; t="$(pane_box_text "$1")" && [ -z "$t" ]; }
 # Types $2 into pane $1 without Enter; status 0 once the box holds exactly that. Enter is left to
 # the caller, so keys that landed in someone's draft are never submitted, and the autocomplete menu
-# has settled on the typed command. On a mismatch the typed text is erased if it ends the box.
+# has settled on the typed command. On a mismatch the typed text is erased if it ends the box, with
+# whatever is before it if that's only blank: the box reads a lone space as empty. TYPE_SEEN then says
+# what the box held, someone else's text by its length only.
 type_text() {
-    local text i; local -a erase=()
+    local text="" seen=0 i n before; local -a erase=()
     $TMUX_CMD send-keys -t "$1" "$2"
     sleep 1
-    text="$(pane_box_text "$1")" || return 1
-    [ "$text" = "$2" ] && return 0
-    if [[ "$text" == *"$2" ]]; then
-        for ((i = 0; i < ${#2}; i++)); do erase+=(BSpace); done
+    # A busy machine can draw the keys seconds late, so the box is read again for a while before they count as lost.
+    for ((i = 0; ; i++)); do
+        if text="$(pane_box_text "$1")"; then
+            seen=1
+            [ "$text" = "$2" ] && return 0
+            [[ "$text" == *"$2" ]] && break
+        else
+            seen=0
+        fi
+        [ "$i" -lt 4 ] || break
+        sleep 0.5
+    done
+    if [ "$seen" = 1 ] && [[ "$text" == *"$2" ]]; then
+        n=${#2}; before="${text%"$2"}"
+        if [ -z "${before//[[:space:]]/}" ]; then
+            n=${#text}; TYPE_SEEN="a blank was before it, erased with it"
+        else
+            TYPE_SEEN="${#before} other characters were before it, left there"
+        fi
+        for ((i = 0; i < n; i++)); do erase+=(BSpace); done
         $TMUX_CMD send-keys -t "$1" "${erase[@]}"
+        return 1
+    fi
+    if [ "$seen" = 0 ]; then TYPE_SEEN="its input box wasn't on screen"
+    elif [ -z "$text" ]; then TYPE_SEEN="its input box stayed empty"
+    elif [[ "$2" == "$text"* ]]; then TYPE_SEEN="its input box showed only $text"
+    else TYPE_SEEN="its input box held ${#text} other characters"
+    fi
+    printf '%s\n' "$2" > "$SIGNAL_DIR/$key.leftover"
+    return 1
+}
+# Keys a typing check gave up on can still show up in the box (type_text leaves them in <key>.leftover), where they'd
+# hold every step that needs it empty. They're erased once the box at rest ends with them, waited for while it shows
+# part of them or nothing (up to LEFTOVER_GRACE), and left alone once it holds anything else.
+erase_leftover() {
+    local lf="$SIGNAL_DIR/$key.leftover" text="" box="" i; local -a erase=()
+    IFS= read -r text < "$lf"; text="${text%$'\r'}"
+    pane_idle "$ctgt" && box="$(pane_box_text "$ctgt")" || return 0
+    if [ -n "$text" ] && [[ "$box" == *"$text" ]]; then
+        for ((i = 0; i < ${#text}; i++)); do erase+=(BSpace); done
+        $TMUX_CMD send-keys -t "$ctgt" "${erase[@]}"
+        evlog "leftover-erased $ctgt $text"
+    elif [[ "$text" == "$box"* ]] && [ "$(file_age "$lf")" -lt "$LEFTOVER_GRACE" ]; then
+        return 0
+    fi
+    rm -f "$lf"
+}
+# Whether a step that types may start: the box is empty, and no keys of ours can still show up in it. Given the
+# step's command ($1), one that has to wait says why, at most every 5 minutes.
+box_free() {
+    local text="" why n="${cpane#%}" now
+    if [ -e "$SIGNAL_DIR/$key.leftover" ]; then why="keys typed earlier can still show up in its input box"
+    elif ! text="$(pane_box_text "$ctgt")"; then why="its input box isn't on screen"
+    elif [ -n "$text" ]; then why="its input box holds ${#text} characters"
+    else return 0
+    fi
+    now="$(date +%s)"
+    if [ -n "${1:-}" ] && [ $((now - ${BOX_HELD_LOGGED[$n]:-0})) -ge 300 ]; then
+        BOX_HELD_LOGGED[$n]="$now"
+        evlog "handoff-held $ctgt $1 ($why)"
     fi
     return 1
 }
@@ -337,9 +425,11 @@ PANE_STATE=(); PANE_UNSEEN=(); PANE_READ_AT=(); PANE_CONTINUED=(); PANE_QUIET=()
 # echoes "❯ /compact" on screen, which pane_pending_compact can't tell from a queued one.
 HANDOFF_REDO=()
 # "=" panes a scroll is holding back this poll, and those whose scroll is already in events.log.
-HANDOFF_HELD=(); HANDOFF_SCROLL_LOGGED=()
+HANDOFF_HELD=(); HANDOFF_SCROLL_LOGGED=(); BOX_HELD_LOGGED=(); TYPE_SEEN=""
 # When each pane's stalled handoff was last checked for a refusal at the context limit.
 LIMIT_CHECKED=()
+# When each pane's /compact after its handoff last failed to type.
+COMPACT_UNTYPED_AT=()
 # The daemon's own handoff -> /compact -> /resume cycle is housekeeping, not a finished turn,
 # until it types a continue that sets Claude working again.
 compaction_in_flight() {
@@ -539,7 +629,7 @@ handoff_at_limit() {
 # make). A copy refused too is left to you: compacting it without a handoff is what this avoids.
 limit_recover() {
     local src="" fork="" tsess="" tpath="" n="${cpane#%}"
-    pane_box_empty "$ctgt" || return 0
+    box_free "/resume" || return 0
     [ -e "$SIGNAL_DIR/$key.slim" ] && IFS=$'\t' read -r src fork _ < "$SIGNAL_DIR/$key.slim"
     fork="${fork%$'\r'}"
     if [ -n "$fork" ] && [ "$fork" = "$1" ]; then
@@ -560,7 +650,7 @@ limit_recover() {
         printf '%s\t%s\n' "$1" "$fork" > "$SIGNAL_DIR/$key.slim"
     fi
     if ! type_text "$ctgt" "/resume $fork"; then
-        : > "$la"; evlog "limit-resume-not-typed $ctgt (input box changed while typing)"; return 0
+        : > "$la"; evlog "limit-resume-not-typed $ctgt ($TYPE_SEEN)"; return 0
     fi
     # The handoff that was refused can't finish now, and the next one runs in the copy.
     rm -f "$SIGNAL_DIR/$key.handoff" "$hs"; : > "$la"; unset "PANE_CONTINUED[$n]"; HANDOFF_REDO[$n]=1
@@ -578,10 +668,10 @@ handoff_redo() {
 }
 start_handoff() {
     handoff_gate_open || return 0
-    pane_idle "$ctgt" && pane_box_empty "$ctgt" \
+    pane_idle "$ctgt" && box_free "/$HANDOFF_CMD" \
         && { [ -n "${HANDOFF_REDO[${cpane#%}]:-}" ] || ! pane_pending_compact "$ctgt"; } || return 0
     if ! type_text "$ctgt" "/$HANDOFF_CMD"; then
-        : > "$la"; evlog "handoff-not-typed $ctgt (input box changed while typing)"; return 0
+        : > "$la"; evlog "handoff-not-typed $ctgt ($TYPE_SEEN)"; return 0
     fi
     # Stamped before Enter: the handoff counts as ours only if it started at or after this mtime.
     : > "$hs"; : > "$la"; unset "PANE_CONTINUED[${cpane#%}]"
@@ -592,16 +682,21 @@ start_handoff() {
 # $1 = the finished handoff's prompt_id, re-checked after the settle.
 compact_after_handoff() {
     local st="" prompt=""
-    pane_idle "$ctgt" && pane_box_empty "$ctgt" \
+    # Another try after a /compact that didn't type waits out the floor between compactions.
+    [ $(( $(date +%s) - ${COMPACT_UNTYPED_AT[${cpane#%}]:-0} )) -lt "$MIN_INTERVAL" ] && return 0
+    pane_idle "$ctgt" && box_free "/compact" \
         && { [ -n "${HANDOFF_REDO[${cpane#%}]:-}" ] || ! pane_pending_compact "$ctgt"; } || return 0
     # A Stop hook that blocks keeps the handoff's turn going after handoff.py marked it done, so
     # the pane must still be at rest a moment later.
     sleep "$SETTLE"
-    pane_idle "$ctgt" && pane_box_empty "$ctgt" || return 0
+    pane_idle "$ctgt" && box_free "/compact" || return 0
     [ -e "$SIGNAL_DIR/$key.handoff" ] && IFS=$'\t' read -r st _ prompt _ < "$SIGNAL_DIR/$key.handoff"
     [ "$st" = done ] && [ "$prompt" = "$1" ] && handoff_usable "$key" || return 0
-    type_text "$ctgt" "/compact" || { evlog "handoff-compact-not-typed $ctgt (input box changed while typing)"; return 0; }
-    rm -f "$hs" "$SIGNAL_DIR/$key.slim"; : > "$cm"; : > "$la"; unset "PANE_CONTINUED[${cpane#%}]" "HANDOFF_REDO[${cpane#%}]"
+    if ! type_text "$ctgt" "/compact"; then
+        COMPACT_UNTYPED_AT[${cpane#%}]="$(date +%s)"; : > "$la"; evlog "handoff-compact-not-typed $ctgt ($TYPE_SEEN)"; return 0
+    fi
+    rm -f "$hs" "$SIGNAL_DIR/$key.slim"; : > "$cm"; : > "$la"
+    unset "PANE_CONTINUED[${cpane#%}]" "HANDOFF_REDO[${cpane#%}]" "COMPACT_UNTYPED_AT[${cpane#%}]"
     $TMUX_CMD send-keys -t "$ctgt" Enter
     evlog "handoff-compact $ctgt $METRIC=$val$evnote"
     [ -n "$CONTINUE_MSG" ] && : > "$SIGNAL_DIR/$key.await-continue"
@@ -693,11 +788,12 @@ while true; do
                 rm -f "$cf" "$SIGNAL_DIR/$key.compacting" "$SIGNAL_DIR/$key.await-continue" "$SIGNAL_DIR/$key.lastauto" "$SIGNAL_DIR/$key.belowsince" "$SIGNAL_DIR/$key.resumewant" "$SIGNAL_DIR/$key.failcount" \
                       "$SIGNAL_DIR/$key.handoffsent" "$SIGNAL_DIR/$key.handoff" "$SIGNAL_DIR/$key.hooked" "$SIGNAL_DIR/$key.guard" "$SIGNAL_DIR/$key.compactwant" \
                       "$SIGNAL_DIR/$key.handoffspent" "$SIGNAL_DIR/$key.slim" "$SIGNAL_DIR/$key.transcript" "$SIGNAL_DIR/$key.forcenote" \
-                      "$SIGNAL_DIR/$key.nohandoff"
-                unset "HANDOFF_REDO[${cpane#%}]"
+                      "$SIGNAL_DIR/$key.nohandoff" "$SIGNAL_DIR/$key.leftover" "$SIGNAL_DIR/$key.remindskip"
+                unset "HANDOFF_REDO[${cpane#%}]" "COMPACT_UNTYPED_AT[${cpane#%}]" "BOX_HELD_LOGGED[${cpane#%}]"
                 continue
             fi
             [ "$rc" = 0 ] || continue               # same %N in several psmux sessions, no server pid to pick one
+            [ -e "$SIGNAL_DIR/$key.leftover" ] && erase_leftover
             # A fork from the last /compact is still waiting to be resumed. Do NOT fire a
             # second /compact on top of it — that stacks compactions and buries the resume
             # behind them. .compacting (set below) holds until the size is confirmed durably
@@ -817,7 +913,7 @@ while true; do
                 [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: skip $ctgt val=$val — pane busy or not at a plain prompt (working, queued input, or a dialog open)" >&2
                 continue
             fi
-            if ! pane_box_empty "$ctgt"; then        # /compact and Enter would submit the draft with it
+            if ! box_free; then                      # /compact and Enter would submit the draft with it
                 [ -n "$DEBUG" ] && echo "compacto-resume-daemon[dbg]: skip $ctgt val=$val — a draft in the input box" >&2
                 continue
             fi

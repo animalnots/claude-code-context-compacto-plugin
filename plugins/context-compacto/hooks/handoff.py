@@ -17,7 +17,8 @@ Every Stop of a session that keeps a transcript also writes the session id to <k
 prompt_id of the turn that ended on a second line. The daemon types the handoff command only into
 panes that have one, because a session started before this plugin version runs no such hooks, and
 after a handoff that never started it waits for a newer one. When the second line names another turn
-than the handoff's, a turn ran after the handoff, so the daemon hands off again before compacting.
+than the handoff's, a turn ran after the handoff, so the daemon hands off again before compacting, and
+in a "=" window the guard refuses a /compact typed by hand until then.
 A start inside tmux also writes <key>.transcript, "session_id<TAB>transcript path", for the daemon to
 check whether the handoff's request was refused at the context limit (see slim_fork.py).
 
@@ -26,7 +27,9 @@ at an idle prompt. So on PostToolUse in a pane it watches, once the pane's expor
 that size, this tells Claude to hand off and end the turn: once a turn, and again each REMIND_STEP
 tokens more. <key>.forcenote holds the last such reminder, "session_id<TAB>prompt_id<TAB>context".
 A session whose handoff never started, which the daemon names in <key>.nohandoff, keeps its window's
-own rule and is told nothing.
+own rule and is told nothing. Each reminder goes to the daemon's events.log, and so does, at most every
+SKIP_LOG_SECS, a turn past that size told nothing because its handoff never started, the daemon's
+heartbeat is stale or the call has no prompt_id; <key>.remindskip holds the last such reason and time.
 
 Config (~/.claude/precompact.conf): handoff_command=<skill or command> (default compact-handoff),
 force_handoff_at=<context tokens> (default 800000, 0 = off). The hook always exits 0 and prints
@@ -50,6 +53,7 @@ REMIND_STEP = 50000
 # The daemon rewrites .daemon.lock/heartbeat every poll. Daemons from before 1.5.16 don't, and they
 # would never run a compaction left to them, so only a fresh one counts as a daemon that will.
 DAEMON_HEARTBEAT_MAX_AGE = 60
+SKIP_LOG_SECS = 300
 
 
 def signal_dir():
@@ -192,21 +196,56 @@ def handoff_never_started(key, session_id):
         return False
 
 
+def force_status(key, session_id):
+    """(context, force_handoff_at, why the daemon won't hand the pane off, or "") once the pane's exported context
+    reaches force_handoff_at, else None."""
+    at = force_handoff_at() if pane_key() else 0
+    sizes = pane_sizes(key) if at else None
+    if not sizes or sizes[0] < at:
+        return None
+    why = ("the resume daemon's heartbeat is stale" if not daemon_alive()
+           else "its handoff never started" if handoff_never_started(key, session_id) else "")
+    return sizes[0], at, why
+
+
 def past_force_handoff_at(key, session_id):
     """(context, force_handoff_at) while the daemon would hand this pane off and compact it at its next idle
     prompt whatever its window's name, else None."""
-    at = force_handoff_at() if pane_key() else 0
-    sizes = pane_sizes(key) if at else None
-    return (sizes[0], at) if (sizes and sizes[0] >= at and daemon_alive()
-                              and not handoff_never_started(key, session_id)) else None
+    status = force_status(key, session_id)
+    return status[:2] if status and not status[2] else None
+
+
+def log_event(line):
+    try:
+        with open(signal_dir() / "events.log", "ab") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n".encode("utf-8"))
+    except OSError:
+        pass
+
+
+def log_skipped(key, ctx, why):
+    path, now = signal_dir() / f"{key}.remindskip", int(time.time())
+    try:
+        last_why, last_at = path.read_text(encoding="utf-8").rstrip("\n").split("\t")
+        if last_why == why and now - int(last_at) < SKIP_LOG_SECS:
+            return
+    except (OSError, ValueError):
+        pass
+    _write(path, f"{why}\t{now}\n")
+    log_event(f"remind-skipped {os.environ.get('TMUX_PANE', '')} ctx={ctx} ({why})")
 
 
 def handoff_reminder(key, session_id, prompt):
     """What to tell Claude when this turn should hand off now, or None."""
-    due = past_force_handoff_at(key, session_id) if prompt else None
-    if not due:
+    status = force_status(key, session_id)
+    if not status:
         return None
-    ctx, at = due
+    ctx, at, why = status
+    if not why and not prompt:
+        why = "no prompt_id"
+    if why:
+        log_skipped(key, ctx, why)
+        return None
     st = read_state(key)
     if st and st["state"] == "running" and (st["session"], st["prompt"]) == (session_id, prompt):
         return None
@@ -214,6 +253,7 @@ def handoff_reminder(key, session_id, prompt):
     if note and note[:2] == (session_id, prompt) and ctx < note[2] + REMIND_STEP:
         return None
     _write(signal_dir() / f"{key}.forcenote", f"{session_id}\t{prompt}\t{ctx}\n")
+    log_event(f"remind-sent {os.environ.get('TMUX_PANE', '')} ctx={ctx}")
     return (f"context-compacto: this session's context is {ctx // 1000}k tokens, past force_handoff_at "
             f"({at // 1000}k). Finish only the step in progress, then run the {handoff_command()} skill to write "
             "the handoff, and end your turn without starting anything else. The resume daemon compacts the "
@@ -232,13 +272,14 @@ def record_guard(key, session_id, prompt, now):
     _write(signal_dir() / f"{key}.guard", f"{session_id}\t{prompt}\t{now}\n")
 
 
-def block_reason(state, session_id, trigger, window_name, now, guard):
+def block_reason(state, session_id, trigger, window_name, now, guard, last_turn=None):
     """Why a compaction must not run now, or None to let it run.
 
     A handoff still running in this session blocks every compaction: a /compact queued behind it
     runs the moment its turn ends, interrupted or not. In a "=" window (without "!") auto
-    compaction is refused, and a manual one needs this session's handoff to have finished. A
-    manual /compact repeated within the REPEAT window of a block of the same state runs anyway.
+    compaction is refused, and a manual one needs this session's handoff to have finished with no
+    turn ended since: last_turn, the prompt_id of the session's last turn to end, when it's known.
+    A manual /compact repeated within the REPEAT window of a block of the same state runs anyway.
     """
     ours = state if state and state.get("session") == session_id else None
     equals = "=" in window_name and "!" not in window_name
@@ -251,6 +292,8 @@ def block_reason(state, session_id, trigger, window_name, now, guard):
         return f"precompact: '=' in the tmux window name: compaction waits for {cmd}, which the resume daemon runs."
     elif equals and not (ours and ours["state"] == "done"):
         reason = f"precompact: '=' in the tmux window name: compact after {cmd} finishes."
+    elif equals and last_turn and last_turn != ours["prompt"]:
+        reason = f"precompact: '=' in the tmux window name: a turn ran after {cmd} finished, so compact after it runs again."
     else:
         return None
     # Claude Code retries its own compaction on every turn, so only a typed /compact can repeat.
@@ -263,11 +306,20 @@ def block_reason(state, session_id, trigger, window_name, now, guard):
     return f"{reason} Run /compact again within {REPEAT_MAX_SECS // 60} minutes to compact anyway."
 
 
+def last_turn(key, session_id):
+    """The prompt_id on <key>.hooked's second line while its first names this session; "" from hooks that stamp none."""
+    try:
+        lines = (signal_dir() / f"{key}.hooked").read_text(encoding="utf-8").split("\n")
+    except (OSError, ValueError):
+        return None
+    return lines[1].rstrip("\r") if len(lines) > 1 and lines[0].rstrip("\r") == session_id else None
+
+
 def check_compaction(session_id, trigger, window_name):
     """block_reason for this session's handoff state, recording a manual block so a repeat can pass."""
     key, now = state_key(session_id), int(time.time())
     state = read_state(key)
-    reason = block_reason(state, session_id, trigger, window_name, now, read_guard(key))
+    reason = block_reason(state, session_id, trigger, window_name, now, read_guard(key), last_turn(key, session_id))
     if reason and trigger == "manual":
         ours = state if state and state.get("session") == session_id else None
         # A PreCompact hook that crashes lets Claude Code compact natively, so the block must

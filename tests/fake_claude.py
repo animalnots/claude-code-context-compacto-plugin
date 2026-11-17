@@ -12,6 +12,7 @@ import pathlib
 import select
 import subprocess
 import sys
+import termios
 import time
 import uuid
 
@@ -42,6 +43,10 @@ ap.add_argument("--old-hooks", action="store_true", help="its Stop hook stamps t
 ap.add_argument("--no-ctx", action="store_true", help="this session's statusline doesn't export its size")
 ap.add_argument("--done-for", default="3s", help="how long the finished turn's status line says it took")
 ap.add_argument("--dialog", action="store_true", help="a question dialog stands where the input box would be")
+ap.add_argument("--suggest", default="", help="the prompt Claude Code suggests next, drawn faint in the idle box")
+ap.add_argument("--faint-rule", action="store_true", help="the input box's top border is drawn faint")
+ap.add_argument("--echo-after", default="0", help="seconds before each typed line's keys show in the box, as a busy "
+                "machine draws them, comma-separated in order, the last repeating; later keys on a shown line show at once")
 args = ap.parse_args()
 
 pane = os.environ["TMUX_PANE"]
@@ -54,6 +59,10 @@ scenarios = args.handoff.split(",")
 resumes = args.resume.split(",")
 compacts = args.compact.split(",")
 limits = args.limit.split(",")
+echo_delays = [float(d) for d in args.echo_after.split(",")]
+# With a delay the fake reads the keys itself, and its box draws "shown", the part of the typed line on screen so far.
+raw = any(echo_delays)
+shown = ""
 # The session's own transcript, which the hooks are given. PreCompact gets a one-line one, so it never summarizes.
 transcript = pathlib.Path(args.transcript)
 short = pathlib.Path(args.log).with_name("precompact.jsonl")
@@ -76,7 +85,11 @@ def log(event):
 
 def render(busy):
     status = "✳ Working… (3s · ↓ 1.2k tokens)" if busy else f"✻ Worked for {args.done_for} · done 11:09"
-    box = "Proceed?\n❯ 1. Yes\n  2. No\n\nEsc to cancel\n" if args.dialog else "─" * 40 + "\n❯\u00a0"
+    rule = f"\033[2m{'─' * 40}\033[0m" if args.faint_rule else "─" * 40
+    box = "Proceed?\n❯ 1. Yes\n  2. No\n\nEsc to cancel\n" if args.dialog else rule + "\n❯\u00a0" + shown
+    if args.suggest and not busy and not args.dialog and not shown:
+        # The cursor goes back to its start, so typed keys draw over it as typing replaces it in Claude Code.
+        box += f"\033[2m{args.suggest}\033[0m\033[{len(args.suggest)}D"
     sys.stdout.write("\033[2J\033[H⏺ fake claude\n" + "".join(h + "\n" for h in history) + "\n" + status + "\n" + box)
     sys.stdout.flush()
     if not args.no_ctx:
@@ -102,7 +115,8 @@ def busy_for(secs):
     end = time.time() + secs
     while (left := end - time.time()) > 0:
         if select.select([sys.stdin], [], [], left)[0]:
-            log("TYPED_WHILE_BUSY " + sys.stdin.readline().strip())
+            got = os.read(sys.stdin.fileno(), 1024).decode(errors="replace") if raw else sys.stdin.readline()
+            log("TYPED_WHILE_BUSY " + got.strip())
 
 
 def refuse(prompt, text):
@@ -213,11 +227,39 @@ def compact():
     render(False)
 
 
+def typed_lines():
+    global shown
+    if not raw:
+        yield from sys.stdin
+        return
+    fd = sys.stdin.fileno()
+    mode = termios.tcgetattr(fd)
+    mode[3] &= ~(termios.ICANON | termios.ECHO)
+    termios.tcsetattr(fd, termios.TCSANOW, mode)
+    line, due, delay = "", None, next_of(echo_delays)
+    while True:
+        if select.select([fd], [], [], None if due is None else max(0.0, due - time.time()))[0]:
+            for ch in os.read(fd, 1024).decode(errors="replace"):
+                if ch in "\r\n":
+                    shown, due = "", None
+                    yield line + "\n"
+                    line, delay = "", next_of(echo_delays)
+                elif ch in "\x7f\b":
+                    line = line[:-1]
+                else:
+                    line += ch
+            if line != shown and due is None:
+                due = time.time() + delay
+        if due is not None and time.time() >= due:
+            shown, due, delay = line, None, 0
+            render(False)
+
+
 if args.hooked:
     stop(str(uuid.uuid4()))
 render(False)
 log("READY")
-for line in sys.stdin:
+for line in typed_lines():
     cmd = line.strip()
     log(f"TYPED {cmd}")
     if cmd == "/compact":
