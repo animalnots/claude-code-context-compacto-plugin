@@ -316,6 +316,44 @@ def test_no_reminder_where_the_daemon_would_not_hand_off(env, why):
     assert reminder(run_hook("handoff.py", call, env)) is None
 
 
+def events(env):
+    p = signals(env) / "events.log"
+    return p.read_text() if p.exists() else ""
+
+
+def test_each_reminder_goes_to_the_daemons_log(env):
+    served(env, 812345)
+    assert reminder(run_hook("handoff.py", tool_call(), env))
+    assert reminder(run_hook("handoff.py", tool_call(), env)) is None
+    assert events(env).count("remind-") == 1 and "remind-sent %7 ctx=812345\n" in events(env)
+
+
+@pytest.mark.parametrize("why,said", [("no prompt id", "no prompt_id"),
+                                      ("a dead daemon", "the resume daemon's heartbeat is stale"),
+                                      ("a handoff that never started", "its handoff never started")])
+def test_a_turn_past_force_handoff_at_told_nothing_says_why_once(env, why, said):
+    served(env, 900000, beat_age=120 if why == "a dead daemon" else 0)
+    if why == "a handoff that never started":
+        (signals(env) / "7.nohandoff").write_text(S1 + "\n")
+    call = tool_call()
+    if why == "no prompt id":
+        del call["prompt_id"]
+    for _ in range(2):
+        assert reminder(run_hook("handoff.py", call, env)) is None
+    assert events(env).count(f"remind-skipped %7 ctx=900000 ({said})") == 1, events(env)
+
+
+@pytest.mark.parametrize("why", ["under force_handoff_at", "reminded already", "the handoff's own turn", "a subagent"])
+def test_silence_by_design_is_not_logged(env, why):
+    served(env, 799999 if why == "under force_handoff_at" else 900000)
+    if why == "reminded already":
+        run_hook("handoff.py", tool_call(), env)
+    if why == "the handoff's own turn":
+        run_hook("handoff.py", handoff_skill(), env)
+    run_hook("handoff.py", tool_call(agent="a20afdcddd057fde7" if why == "a subagent" else None), env)
+    assert "remind-skipped" not in events(env)
+
+
 def running(prompt=P1, session=S1):
     return {"state": "running", "session": session, "prompt": prompt, "started": 1000, "ended": None}
 
@@ -376,6 +414,30 @@ def test_equals_window_needs_a_finished_handoff_or_a_repeat(handoff, state):
     assert handoff.block_reason(st, S1, "manual", "glossary=", now=2000, guard=None)
     prompt = st["prompt"] if st and st["session"] == S1 else ""
     assert handoff.block_reason(st, S1, "manual", "glossary=", now=2010, guard=(S1, prompt, 2000)) is None
+
+
+def test_equals_window_needs_a_handoff_that_covers_the_last_turn_or_a_repeat(handoff):
+    done = dict(running(), state="done", ended=1500)
+    reason = handoff.block_reason(done, S1, "manual", "glossary=", now=2000, guard=None, last_turn=P2)
+    assert "ran after /compact-handoff" in reason and "again" in reason
+    assert handoff.block_reason(done, S1, "manual", "glossary=", now=2010, guard=(S1, P1, 2000), last_turn=P2) is None
+
+
+@pytest.mark.parametrize("last", [P1, "", None], ids=["the handoff's turn", "hooks that stamp no turn", "unknown"])
+def test_equals_window_compacts_by_hand_while_the_handoffs_turn_is_the_last(handoff, last):
+    done = dict(running(), state="done", ended=1500)
+    assert handoff.block_reason(done, S1, "manual", "glossary=", now=2000, guard=None, last_turn=last) is None
+
+
+@pytest.mark.parametrize("stamp,blocked", [(f"{S1}\n{P2}\n", True), (f"{S1}\n{P1}\n", False), (f"{S2}\n{P2}\n", False),
+                                           (f"{S1}\n", False), (f"{S1}\r\n{P2}\r\n", True)],
+                         ids=["a later turn", "the handoff's turn", "another session's turn", "no turn stamped",
+                              "a later turn, Windows line ends"])
+def test_the_guard_reads_the_panes_last_turn(handoff, env, stamp, blocked):
+    key = handoff.state_key(S1)
+    handoff.write_state(key, dict(running(), state="done", ended=1500))
+    (signals(env) / f"{key}.hooked").write_text(stamp)
+    assert bool(handoff.check_compaction(S1, "manual", "glossary=")) is blocked
 
 
 def test_bang_wins_over_equals_for_manual_compacts(handoff):

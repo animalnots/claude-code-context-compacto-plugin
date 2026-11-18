@@ -44,12 +44,14 @@ class Rig:
         self.clients = []
 
     def start(self, window, msgs, handoff="ok", hooked=True, draft="", daemon=True, resume="ok", ctx=True,
-              compact="ok", old_hooks=False, done_for="3s", dialog=False, context=None, limit="no"):
+              compact="ok", old_hooks=False, done_for="3s", dialog=False, context=None, limit="no", suggest="",
+              echo_after="0", faint_rule=False, blurred=False):
         cmd = [sys.executable, str(FAKE), "--log", str(self.log), "--transcript", str(self.transcript),
                "--msgs", str(msgs), "--handoff", handoff, "--resume", resume, "--compact", compact,
-               "--done-for", done_for, "--limit", limit] \
+               "--done-for", done_for, "--limit", limit, "--suggest", suggest, "--echo-after", echo_after] \
             + (["--hooked"] if hooked else []) + ([] if ctx else ["--no-ctx"]) \
             + (["--old-hooks"] if old_hooks else []) + (["--dialog"] if dialog else []) \
+            + (["--faint-rule"] if faint_rule else []) + (["--blurred"] if blurred else []) \
             + (["--ctx", str(context)] if context is not None else [])
         subprocess.run(self.tmux + ["new-session", "-d", "-s", "t", "-n", window, "-x", "120", "-y", "30",
                                     shlex.join(cmd)], env=self.env, check=True)
@@ -321,8 +323,112 @@ def test_a_draft_in_the_input_box_holds_the_handoff(rig):
     rig.start("gloss=", 600000, draft="hello")
     time.sleep(4)
     assert rig.typed() == []
+    log = rig.daemon_log()
+    assert log.count("handoff-held %0 /compact-handoff (its input box holds 5 characters)") == 1, log
     rig.keys(*["BSpace"] * 5)
     rig.wait_for("TYPED /compact-handoff")
+    assert "hello" not in rig.daemon_log()
+
+
+@pytest.mark.parametrize("blurred", [False, True])
+@pytest.mark.parametrize("window,msgs,first", [("gloss=", 600000, "/compact-handoff"), ("gloss", 300000, "/compact")])
+def test_a_suggested_prompt_in_the_input_box_holds_nothing(rig, window, msgs, first, blurred):
+    rig.start(window, msgs, suggest="run the tests", blurred=blurred)
+    rig.wait_for("COMPACTED")
+    assert rig.typed()[0] == first
+
+
+def box_text(*lines):
+    awk = DAEMON.read_text().split("IFS= read -r -d '' BOX_AWK <<'AWK'\n", 1)[1].split("\nAWK\n", 1)[0]
+    screen = "\n".join(["─" * 40, *lines, "─" * 40]) + "\n"
+    return subprocess.run(["/usr/bin/awk", awk], input=screen.encode(), capture_output=True, check=True,
+                          env=dict(os.environ, LC_ALL="C")).stdout.decode()
+
+
+@pytest.mark.parametrize("lines,text", [
+    pytest.param(["❯ \033[7mr\033[0;2mun the tests\033[0m"], "", id="suggestion"),
+    pytest.param(["\033[38;5;246m❯ \033[7m\033[39mr\033[0;2mun the tests\033[0m"], "", id="suggestion-coloured-prompt"),
+    pytest.param(["❯ \033[7mr\033[0;2m\033[38;5;246mun the tests\033[0m"], "", id="suggestion-in-a-colour"),
+    pytest.param(["❯ \033[2mrun the tests\033[0m"], "", id="suggestion-all-faint"),
+    pytest.param(["❯ \033[7mз\033[0;2mапусти тесты\033[0m"], "", id="suggestion-multibyte"),
+    pytest.param(["❯ \033[7mr\033[0;2mun the tests and then fix whatever fa", "ils in the daemon please\033[0m"], "",
+                 id="suggestion-wrapped"),
+    pytest.param(["❯ \033[7m \033[0m"], "", id="empty"),
+    pytest.param(["\033[38;5;246m❯ \033[7m\033[39m \033[0m"], "", id="empty-coloured-prompt"),
+    pytest.param(["❯ \033[7mx\033[0m"], "x", id="letter-under-the-cursor"),
+    pytest.param(["❯ hello\033[7m \033[0m"], "hello", id="draft-then-cursor"),
+    pytest.param(["❯ he\033[7ml\033[0mlo"], "hello", id="cursor-inside-a-draft"),
+    pytest.param(["❯ /comp\033[7ma\033[0;2mct"], "/compa", id="inline-completion"),
+    pytest.param(["❯ \033[38;5;7mx\033[2m\033[39mhint\033[0m"], "x", id="colour-7-before-a-hint"),
+])
+def test_the_input_box_reads_typed_text_and_not_a_hint_or_the_cursor_on_it(lines, text):
+    assert box_text(*lines) == text
+
+
+def test_an_input_box_with_a_faint_border_is_still_typed_into(rig):
+    rig.start("gloss=", 600000, faint_rule=True)
+    rig.wait_for("COMPACTED")
+    assert rig.typed()[:2] == ["/compact-handoff", "/compact"]
+
+
+def test_keys_a_slow_screen_shows_late_still_count_as_typed(rig):
+    rig.start("gloss=", 600000, echo_after="2")
+    rig.wait_for("COMPACTED", timeout=40)
+    assert rig.typed()[:2] == ["/compact-handoff", "/compact"]
+    assert "not-typed" not in rig.daemon_log()
+
+
+def test_a_stray_space_in_the_input_box_goes_with_the_typed_handoff(rig):
+    rig.start("gloss=", 600000, draft=" ")
+    rig.wait_for("COMPACTED", timeout=30)
+    assert rig.typed()[:2] == ["/compact-handoff", "/compact"]
+    assert "handoff-not-typed %0 (a blank was before it, erased with it)" in rig.daemon_log()
+
+
+def test_keys_that_show_after_the_typing_check_gave_up_are_erased_and_typed_again(rig):
+    rig.start("gloss=", 600000, echo_after="5,0")
+    rig.wait_for("COMPACTED", timeout=40)
+    assert rig.typed()[:2] == ["/compact-handoff", "/compact"]
+    log = rig.daemon_log()
+    assert "handoff-not-typed %0 (its input box stayed empty)" in log and "leftover-erased %0 /compact-handoff" in log
+
+
+def test_late_keys_that_show_in_part_first_are_waited_for_then_erased(rig):
+    rig.start("gloss=", 600000, echo_after="5,0")
+    rig.wait_log("handoff-not-typed %0 (its input box stayed empty)")
+    rig.keys(*["BSpace"] * 3)
+    time.sleep(3)
+    rig.keys("o", "f", "f")
+    rig.wait_for("COMPACTED", timeout=30)
+    assert rig.typed()[:2] == ["/compact-handoff", "/compact"]
+    assert "leftover-erased %0 /compact-handoff" in rig.daemon_log()
+
+
+def test_late_keys_after_a_late_draft_are_erased_and_the_draft_kept(rig):
+    rig.start("gloss=", 600000, draft="hello", echo_after="8,0")
+    rig.wait_log("leftover-erased %0 /compact-handoff", timeout=20)
+    time.sleep(2)
+    assert rig.typed() == []
+    rig.keys(*["BSpace"] * 5)
+    rig.wait_for("COMPACTED", timeout=30)
+    assert rig.typed()[:2] == ["/compact-handoff", "/compact"]
+
+
+def test_the_compact_after_a_quick_handoff_does_not_wait_for_the_floor(rig):
+    rig.env["COMPACTO_MIN_COMPACT_INTERVAL"] = "30"
+    rig.start("gloss=", 600000)
+    rig.wait_for("COMPACTED")
+
+
+def test_a_compact_whose_typing_failed_is_tried_again_only_after_the_floor(rig):
+    rig.env["COMPACTO_MIN_COMPACT_INTERVAL"] = "6"
+    rig.start("gloss=", 600000, echo_after="0,5,0")
+    rig.wait_for("COMPACTED", timeout=60)
+    assert rig.typed()[:2] == ["/compact-handoff", "/compact"]
+    first = {}
+    for ln in rig.daemon_log().splitlines():
+        first.setdefault(ln.split()[2], time.mktime(time.strptime(ln[:19], "%Y-%m-%d %H:%M:%S")))
+    assert first["handoff-compact"] - first["handoff-compact-not-typed"] >= 5
 
 
 def test_claude_codes_own_compaction_mid_turn_runs_at_the_next_idle_prompt(rig):
