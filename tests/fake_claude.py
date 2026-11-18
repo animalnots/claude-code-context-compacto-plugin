@@ -43,7 +43,10 @@ ap.add_argument("--old-hooks", action="store_true", help="its Stop hook stamps t
 ap.add_argument("--no-ctx", action="store_true", help="this session's statusline doesn't export its size")
 ap.add_argument("--done-for", default="3s", help="how long the finished turn's status line says it took")
 ap.add_argument("--dialog", action="store_true", help="a question dialog stands where the input box would be")
-ap.add_argument("--suggest", default="", help="the prompt Claude Code suggests next, drawn faint in the idle box")
+ap.add_argument("--suggest", default="", help="the prompt Claude Code suggests next, shown in the idle box with its "
+                "first letter under the cursor, in reverse video, and the rest faint")
+ap.add_argument("--blurred", action="store_true", help="draw the whole suggestion faint, as Claude Code does in a pane "
+                "it was told lost focus")
 ap.add_argument("--faint-rule", action="store_true", help="the input box's top border is drawn faint")
 ap.add_argument("--echo-after", default="0", help="seconds before each typed line's keys show in the box, as a busy "
                 "machine draws them, comma-separated in order, the last repeating; later keys on a shown line show at once")
@@ -88,8 +91,10 @@ def render(busy):
     rule = f"\033[2m{'─' * 40}\033[0m" if args.faint_rule else "─" * 40
     box = "Proceed?\n❯ 1. Yes\n  2. No\n\nEsc to cancel\n" if args.dialog else rule + "\n❯\u00a0" + shown
     if args.suggest and not busy and not args.dialog and not shown:
+        s = args.suggest
+        hint = f"\033[2m{s}\033[0m" if args.blurred else f"\033[7m{s[0]}\033[27m\033[2m{s[1:]}\033[22m"
         # The cursor goes back to its start, so typed keys draw over it as typing replaces it in Claude Code.
-        box += f"\033[2m{args.suggest}\033[0m\033[{len(args.suggest)}D"
+        box += f"{hint}\033[{len(s)}D"
     sys.stdout.write("\033[2J\033[H⏺ fake claude\n" + "".join(h + "\n" for h in history) + "\n" + status + "\n" + box)
     sys.stdout.flush()
     if not args.no_ctx:

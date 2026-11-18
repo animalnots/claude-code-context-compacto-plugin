@@ -258,14 +258,13 @@ pane_pending_compact() {
 # and a no-break space, and awks disagree on Unicode outside it.
 IFS= read -r -d '' BOX_AWK <<'AWK'
 BEGIN { nbsp = sprintf("%c%c", 194, 160); esc = sprintf("%c", 27); bel = sprintf("%c", 7) }
-# The line without its escapes or the cells they draw faint: Claude Code draws its placeholder and the prompt it
-# suggests faint, and a box holding only those is empty. As tmux writes it, faint lasts into the next line until
-# an escape ends it. The box itself is found in drawn, the line with every cell, as classify finds it.
-function plain(s,    out, i, j, c, n, p, k) {
-    out = drawn = ""
+# The line without its escapes or faint cells, which hold Claude Code's placeholder and the prompt it suggests. As
+# tmux writes it, faint lasts into the next line until an escape ends it. The box itself is found in drawn, the line
+# with every cell, as classify finds it.
+function plain(s,    i, j, c, n, p, k) {
+    out = drawn = bare = cursor = ""
     while ((i = index(s, esc)) > 0) {
-        if (!faint) out = out substr(s, 1, i - 1)
-        drawn = drawn substr(s, 1, i - 1)
+        put(substr(s, 1, i - 1))
         c = substr(s, i + 1, 1); s = substr(s, i + 2)
         if (c == "]") {                                     # a hyperlink, ended by BEL or ESC \
             j = index(s, bel); k = index(s, esc "\\")
@@ -273,28 +272,45 @@ function plain(s,    out, i, j, c, n, p, k) {
         } else if (c == "[" && match(s, /[@-~]/)) {
             if (substr(s, RSTART, 1) == "m") {
                 n = split(substr(s, 1, RSTART - 1), p, ";")
-                if (!n) faint = 0
+                if (!n) faint = rev = 0
                 # 38, 48 and 58 take a colour: 5;N or 2;R;G;B, whose numbers aren't attributes.
                 for (k = 1; k <= n; k++)
-                    if (p[k] == "" || p[k] == "0" || p[k] == "22") faint = 0
+                    if (p[k] == "" || p[k] == "0") faint = rev = 0
+                    else if (p[k] == "22") faint = 0
                     else if (p[k] == "2") faint = 1
+                    else if (p[k] == "27") rev = 0
+                    else if (p[k] == "7") rev = 1
                     else if (p[k] ~ /^[345]8$/) k += (p[k + 1] == "5") ? 2 : ((p[k + 1] == "2") ? 4 : 0)
             }
             s = substr(s, RSTART + 1)
         }
     }
-    drawn = drawn s
-    return faint ? out : out s
+    put(s)
+    bare = bare cursor
+    return out
 }
-{ line[++n] = plain($0); cells[n] = drawn }
+# bare also drops reverse-video cells right before faint ones: at a focused prompt Claude Code draws its cursor that
+# way, on a hint's first letter. A box holding only those reads empty; any other keeps them, as a typed letter can be
+# under the cursor.
+function put(t) {
+    drawn = drawn t
+    if (t == "") return
+    if (faint) cursor = ""
+    else if (rev) { out = out t; cursor = cursor t }
+    else { out = out t; bare = bare cursor t; cursor = "" }
+}
+function box_text(row,    t, i) {
+    t = row[box]; sub(/^❯/, "", t)
+    if (index(t, nbsp) == 1) t = substr(t, 3)
+    for (i = box + 1; i <= n && cells[i] !~ /^───/; i++) t = t "\n" row[i]
+    sub(/[ \n]+$/, "", t)
+    return t
+}
+{ line[++n] = plain($0); cells[n] = drawn; typed[n] = bare }
 END {
     for (i = 2; i <= n; i++) if (cells[i] ~ /^❯/) box = (cells[i - 1] ~ /^───/ && cells[i] !~ /^❯ [0-9]+\. /) ? i : 0
     if (!box) exit 1
-    text = line[box]; sub(/^❯/, "", text)
-    if (index(text, nbsp) == 1) text = substr(text, 3)
-    for (i = box + 1; i <= n && cells[i] !~ /^───/; i++) text = text "\n" line[i]
-    sub(/[ \n]+$/, "", text)
-    printf "%s", text
+    printf "%s", (box_text(typed) == "") ? "" : box_text(line)
 }
 AWK
 pane_box_text()  { $TMUX_CMD capture-pane -p $BOX_ATTRS -t "$1" 2>/dev/null | LC_ALL=C awk "$BOX_AWK"; }

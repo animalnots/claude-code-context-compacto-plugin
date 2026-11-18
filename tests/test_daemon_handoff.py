@@ -45,13 +45,13 @@ class Rig:
 
     def start(self, window, msgs, handoff="ok", hooked=True, draft="", daemon=True, resume="ok", ctx=True,
               compact="ok", old_hooks=False, done_for="3s", dialog=False, context=None, limit="no", suggest="",
-              echo_after="0", faint_rule=False):
+              echo_after="0", faint_rule=False, blurred=False):
         cmd = [sys.executable, str(FAKE), "--log", str(self.log), "--transcript", str(self.transcript),
                "--msgs", str(msgs), "--handoff", handoff, "--resume", resume, "--compact", compact,
                "--done-for", done_for, "--limit", limit, "--suggest", suggest, "--echo-after", echo_after] \
             + (["--hooked"] if hooked else []) + ([] if ctx else ["--no-ctx"]) \
             + (["--old-hooks"] if old_hooks else []) + (["--dialog"] if dialog else []) \
-            + (["--faint-rule"] if faint_rule else []) \
+            + (["--faint-rule"] if faint_rule else []) + (["--blurred"] if blurred else []) \
             + (["--ctx", str(context)] if context is not None else [])
         subprocess.run(self.tmux + ["new-session", "-d", "-s", "t", "-n", window, "-x", "120", "-y", "30",
                                     shlex.join(cmd)], env=self.env, check=True)
@@ -330,11 +330,39 @@ def test_a_draft_in_the_input_box_holds_the_handoff(rig):
     assert "hello" not in rig.daemon_log()
 
 
+@pytest.mark.parametrize("blurred", [False, True])
 @pytest.mark.parametrize("window,msgs,first", [("gloss=", 600000, "/compact-handoff"), ("gloss", 300000, "/compact")])
-def test_a_suggested_prompt_in_the_input_box_holds_nothing(rig, window, msgs, first):
-    rig.start(window, msgs, suggest="run the tests")
+def test_a_suggested_prompt_in_the_input_box_holds_nothing(rig, window, msgs, first, blurred):
+    rig.start(window, msgs, suggest="run the tests", blurred=blurred)
     rig.wait_for("COMPACTED")
     assert rig.typed()[0] == first
+
+
+def box_text(*lines):
+    awk = DAEMON.read_text().split("IFS= read -r -d '' BOX_AWK <<'AWK'\n", 1)[1].split("\nAWK\n", 1)[0]
+    screen = "\n".join(["─" * 40, *lines, "─" * 40]) + "\n"
+    return subprocess.run(["/usr/bin/awk", awk], input=screen.encode(), capture_output=True, check=True,
+                          env=dict(os.environ, LC_ALL="C")).stdout.decode()
+
+
+@pytest.mark.parametrize("lines,text", [
+    pytest.param(["❯ \033[7mr\033[0;2mun the tests\033[0m"], "", id="suggestion"),
+    pytest.param(["\033[38;5;246m❯ \033[7m\033[39mr\033[0;2mun the tests\033[0m"], "", id="suggestion-coloured-prompt"),
+    pytest.param(["❯ \033[7mr\033[0;2m\033[38;5;246mun the tests\033[0m"], "", id="suggestion-in-a-colour"),
+    pytest.param(["❯ \033[2mrun the tests\033[0m"], "", id="suggestion-all-faint"),
+    pytest.param(["❯ \033[7mз\033[0;2mапусти тесты\033[0m"], "", id="suggestion-multibyte"),
+    pytest.param(["❯ \033[7mr\033[0;2mun the tests and then fix whatever fa", "ils in the daemon please\033[0m"], "",
+                 id="suggestion-wrapped"),
+    pytest.param(["❯ \033[7m \033[0m"], "", id="empty"),
+    pytest.param(["\033[38;5;246m❯ \033[7m\033[39m \033[0m"], "", id="empty-coloured-prompt"),
+    pytest.param(["❯ \033[7mx\033[0m"], "x", id="letter-under-the-cursor"),
+    pytest.param(["❯ hello\033[7m \033[0m"], "hello", id="draft-then-cursor"),
+    pytest.param(["❯ he\033[7ml\033[0mlo"], "hello", id="cursor-inside-a-draft"),
+    pytest.param(["❯ /comp\033[7ma\033[0;2mct"], "/compa", id="inline-completion"),
+    pytest.param(["❯ \033[38;5;7mx\033[2m\033[39mhint\033[0m"], "x", id="colour-7-before-a-hint"),
+])
+def test_the_input_box_reads_typed_text_and_not_a_hint_or_the_cursor_on_it(lines, text):
+    assert box_text(*lines) == text
 
 
 def test_an_input_box_with_a_faint_border_is_still_typed_into(rig):
