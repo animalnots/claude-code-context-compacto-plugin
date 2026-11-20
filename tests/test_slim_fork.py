@@ -400,7 +400,7 @@ def test_the_cli_checks_the_limit_and_writes_a_copy_with_the_subagents(tmp_path,
     assert (tmp_path / new_id / "subagents" / "agent-a1.jsonl").read_text() == "{}\n"
 
 
-@pytest.mark.parametrize("args", [(), ("make",), ("at-limit", "x"), ("other", "x")])
+@pytest.mark.parametrize("args", [(), ("make",), ("at-limit", "x"), ("other", "x"), ("no-tool-running",)])
 def test_the_cli_rejects_bad_arguments(args):
     assert run_cli(*args).returncode == 2
 
@@ -408,3 +408,53 @@ def test_the_cli_rejects_bad_arguments(args):
 def test_the_cli_reports_a_copy_it_cannot_make(tmp_path):
     r = run_cli("make", write(tmp_path, [entry("user", "u1", None, "hi"), refused("e1", "u1")]))
     assert r.returncode == 1 and r.stdout == "" and "slim_fork" in r.stderr
+
+
+def test_entries_are_read_newest_first_across_the_tail(tmp_path):
+    rows = [entry("user", f"u{i}", None, "y" * (i * 37)) for i in range(40)]
+    path = write(tmp_path, rows[:20] + [{"no": "json"}] + rows[20:])
+    path.write_text(path.read_text().replace('{"no": "json"}', "not json"))
+    for tail in (1 << 20, 900, 1):
+        assert [e["uuid"] for e in rewrite_transcript.entries_from_end(str(path), tail)] == [f"u{i}" for i in range(39, -1, -1)]
+
+
+def call(uid, parent, *ids, message_id="m1"):
+    return entry("assistant", uid, parent, [{"type": "tool_use", "id": i, "name": "Bash", "input": {}} for i in ids],
+                 message_id=message_id)
+
+
+def answer(uid, parent, *ids):
+    return entry("user", uid, parent, [{"type": "tool_result", "tool_use_id": i, "content": "ok"} for i in ids])
+
+
+PROMPT = entry("user", "u1", None, "build it")
+RUNS = [PROMPT, call("a1", "u1", "t1")]
+TWO_RUN = [PROMPT, call("a1", "u1", "t1"), call("a2", "a1", "t2")]
+
+
+@pytest.mark.parametrize("rows,free", [
+    (RUNS, False),
+    (RUNS + [answer("r1", "a1", "t1")], True),
+    (TWO_RUN + [answer("r1", "a2", "t1")], False),
+    (TWO_RUN + [answer("r1", "a2", "t1"), answer("r2", "r1", "t2")], True),
+    (TWO_RUN + [answer("r1", "a2", "t1", "t2")], True),
+    (RUNS + [answer("r1", "a1", "t1"), entry("assistant", "a2", "r1", [{"type": "thinking", "thinking": ""}],
+                                             message_id="m2")], True),
+    (RUNS + [answer("r1", "a1", "t1"), dict(call("s1", "r1", "t9", message_id="m9"), isSidechain=True)], True),
+    (RUNS + [{"type": "attachment", "uuid": "at1", "parentUuid": "a1", "attachment": {"type": "queued_command"}}], False),
+    (RUNS + [answer("r1", "a1", "t1"), entry("user", "s1", "r1", [{"type": "text", "text": "Base directory for this skill"}])],
+     True),
+    ([PROMPT], True),
+    ([PROMPT, entry("assistant", "a1", "u1", [{"type": "text", "text": "done"}], message_id="m1")], True),
+    ([{"type": "custom-title", "customTitle": "x", "sessionId": SESSION}], False),
+], ids=["a tool runs", "its result is in", "one of two runs", "both answered", "both in one result",
+        "thinking after a result", "a subagent's tool", "a notification after a running tool", "a skill's text",
+        "a prompt being answered", "a finished reply", "nothing to tell from"])
+def test_a_tool_call_runs_until_its_result_is_written(tmp_path, rows, free):
+    path = write(tmp_path, rows)
+    assert slim_fork.no_tool_running(str(path)) is free
+    assert run_cli("no-tool-running", path).returncode == (0 if free else 1)
+
+
+def test_a_transcript_that_cannot_be_read_tells_nothing(tmp_path):
+    assert run_cli("no-tool-running", tmp_path / "missing.jsonl").returncode == 1

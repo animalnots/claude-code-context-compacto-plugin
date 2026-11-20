@@ -150,13 +150,15 @@ def _show():
     # absent auto_compact_at means the default threshold, so dumping the file alone
     # can't tell what is in force. Always spell them out.
     conf = _read_conf()
-    print("automation:  auto_resume={}  auto_compact_at={} ({})  force_handoff_at={}  resume_continue={}".format(
-        "on" if conf.get("auto_resume") else "off",
-        _auto_compact_state(conf),
-        conf.get("auto_compact_metric") or "msgs",
-        _force_handoff_state(conf),
-        conf.get("resume_continue") or "off",
-    ))
+    print("automation:  auto_resume={}  auto_compact_at={} ({})  force_handoff_at={}  force_stop={}  "
+          "resume_continue={}".format(
+              "on" if conf.get("auto_resume") else "off",
+              _auto_compact_state(conf),
+              conf.get("auto_compact_metric") or "msgs",
+              _force_handoff_state(conf),
+              "off" if handoff.daemon_conf("force_stop") in ("0", "off") else "on",
+              conf.get("resume_continue") or "off",
+          ))
 
 
 def _auto_compact_state(conf):
@@ -393,8 +395,10 @@ Autonomous loop (UNATTENDED, no cap): /cc:autocompact N + /cc:continue MSG make 
   Past force_handoff_at=N context tokens in the config file (default 800000, 0 = off)
   every window hands off then compacts that way, ! ones too: Claude is asked mid-turn
   to run the handoff and end its turn, and the daemon types it at the next idle prompt
-  unless it just ran. A handoff refused at the context limit runs in a slim copy of
-  the session (no thinking or images, long tool outputs cut), which the daemon resumes.
+  unless it just ran. A turn still running 2 minutes later with no handoff is stopped
+  with Esc between tool calls (force_stop=0 = never). A handoff refused at the context
+  limit runs in a slim copy of the session (no thinking or images, long tool outputs
+  cut), which the daemon resumes.
 
 Window markers (daemon running, inside tmux): the window option @cc_state is
   ? when a dialog waits for you, ^ when a window due a handoff is scrolled
