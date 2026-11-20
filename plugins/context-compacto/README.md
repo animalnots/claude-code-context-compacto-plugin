@@ -326,6 +326,7 @@ Auto-resume and the autonomous loop also run on native Windows inside [psmux](ht
 
 - **Preserved verbatim:** all `text`, `tool_use`, `tool_result`, `image` blocks in the head and tail windows. `message.usage` is stripped (it leaks parent-session counts).
 - **Dropped:** `thinking` / `redacted_thinking` blocks (empty-text under Opus 4.8's default display — only a large opaque signature would remain, which is same-model replay-validation weight that can't be partially kept). Assistant entries that are *only* thinking are removed whole, so the fork carries real conversation instead of signature mass.
+- **Left out:** Claude Code's request log (`api-request`, `api-request-shape`, `api-request-blob` and `api-request-resumed` entries), in forks and slim copies alike. Resume ignores it, and copying it would make each fork carry the logs of every fork before it.
 - **Truncated:** `tool_result` blocks > `PRECOMPACT_MAX_BLOCK_TOKENS` (default 3000) and embedded file content in attachments. **Plain text blocks are never truncated.**
 - **Compressed:** middle entries are sent raw to the summarizer (no per-block truncation applied to the summarizer's input — only to the fork on disk).
 

@@ -345,6 +345,43 @@ def test_a_subagents_error_does_not_count_and_a_long_tail_is_read_through(tmp_pa
     assert not slim_fork.at_limit(str(path), 0)
 
 
+REQUEST_LOG = [
+    {"type": "api-request-shape", "sessionId": SESSION, "shapeHash": "s" * 64, "shape": {"system": BIG}},
+    {"type": "api-request-blob", "sessionId": SESSION, "hash": "b" * 64, "message": {"role": "user", "content": BIG}},
+    {"type": "api-request", "sessionId": SESSION, "id": "q1", "shapeHash": "s" * 64, "tail": ["b" * 64]},
+    {"type": "api-request-resumed", "sessionId": SESSION},
+]
+
+
+def with_request_log(rows):
+    return [x for r in rows for x in [r, *(REQUEST_LOG if r.get("type") in ("user", "assistant") else [])]]
+
+
+def said(rows):
+    return [(m["type"], m["message"]["content"]) for m in messages(rows)]
+
+
+def request_log_rows(rows):
+    return [r for r in rows if r.get("type", "").startswith("api-request")]
+
+
+def test_the_slim_copy_leaves_out_claude_codes_request_log(tmp_path):
+    plain = fork_rows(tmp_path, rewrite_transcript.slim(str(write(tmp_path, conversation(), name="plain"))))
+    rows = fork_rows(tmp_path, rewrite_transcript.slim(str(write(tmp_path, with_request_log(conversation())))))
+    assert request_log_rows(rows) == []
+    assert said(rows) == said(plain)
+
+
+def test_the_compacted_fork_leaves_out_claude_codes_request_log(tmp_path, monkeypatch):
+    monkeypatch.setenv("PRECOMPACT_HEAD_TOKENS", "0")
+    monkeypatch.setenv("PRECOMPACT_TAIL_TOKENS", "50")
+    plain = fork_rows(tmp_path, rewrite_transcript.rewrite(str(write(tmp_path, conversation(), name="plain")), "summary"))
+    rows = fork_rows(tmp_path, rewrite_transcript.rewrite(str(write(tmp_path, with_request_log(conversation()))), "summary"))
+    assert request_log_rows(rows) == []
+    assert said(rows) == said(plain)
+    assert len(messages(rows)) < len(messages(conversation()))
+
+
 def run_cli(*args):
     return subprocess.run([sys.executable, str(HOOKS / "slim_fork.py"), *map(str, args)],
                           capture_output=True, text=True, timeout=60)
