@@ -59,9 +59,14 @@ ap.add_argument("--tool", type=float, default=0, help="the turn's tool call writ
                 "this many seconds; under 0, never")
 ap.add_argument("--turn-skill", action="store_true", help="the turn runs the handoff skill as it starts")
 ap.add_argument("--turn-dialog", action="store_true", help="a dialog, with no spinner, stands over the turn")
+ap.add_argument("--permission", action="store_true", help="that dialog asks to run the turn's tool call, so an Esc "
+                "refuses the call, which ends the turn with no Stop")
+ap.add_argument("--turn-prompt", default="", help="the turn's prompt_id, on each of its user entries (default: a new "
+                "one); a Stop hook that keeps the handoff's own turn going keeps the handoff's")
 ap.add_argument("--queued", default="", help="a command typed before the turn's first frame, run once it ends")
 ap.add_argument("--deaf", action="store_true", help="an Esc doesn't end the turn")
-ap.add_argument("--compacting", action="store_true", help="the busy spinner says a compaction runs")
+ap.add_argument("--compacting", default="", help="the busy spinner's text while a compaction runs, e.g. Compacting "
+                "conversation (Claude Code's own) or Running PreCompact hooks (the plugin's, run inside that hook)")
 ap.add_argument("--note", default="", help="a line of the conversation on screen")
 ap.add_argument("--stale-dialog", action="store_true", help="a dialog left from before stands over the prompt once a "
                 "request is refused at the context limit, until an Esc")
@@ -104,7 +109,7 @@ def log(event):
 
 
 def render(busy):
-    spinner = f"✳ {'Compacting conversation' if args.compacting else 'Working'}… (3s · ↓ 1.2k tokens)"
+    spinner = f"✳ {args.compacting or 'Working'}… (3s · ↓ 1.2k tokens)"
     status = ("" if dialog else spinner) if busy else f"✻ Worked for {args.done_for} · done 11:09"
     rule = f"\033[2m{'─' * 40}\033[0m" if args.faint_rule else "─" * 40
     waiting = f"❯ {queued}\n  ctrl+enter to send now\n" if busy and queued else ""
@@ -248,7 +253,8 @@ def tool_turn(handoff_skill):
 
 def background_turn():
     global dialog, queued
-    prompt = str(uuid.uuid4())
+    prompt = args.turn_prompt or str(uuid.uuid4())
+    write_entries({"type": "user", "promptId": prompt, "message": {"role": "user", "content": "a task ended"}})
     if args.turn_skill:
         tool_call(prompt, "Skill", {"skill": "compact-handoff"})
     if args.tool:
@@ -266,7 +272,7 @@ def background_turn():
             for _ in range(got.count("\x1b")):
                 log("ESC")
                 if dialog:
-                    dialog = False
+                    dialog, stopped = False, args.permission
                     log("DIALOG_CLOSED")
                     render(True)
                 elif not args.deaf:
@@ -274,7 +280,7 @@ def background_turn():
             if got.replace("\x1b", "").strip():
                 log("TYPED_WHILE_BUSY " + got.replace("\x1b", "").strip())
         if answer_at is not None and time.time() >= answer_at:
-            write_entries({"type": "user", "message": {"role": "user", "content": [
+            write_entries({"type": "user", "promptId": prompt, "message": {"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "t-tool", "content": "ok"}]}})
             answer_at = None
             log("TOOL_DONE")

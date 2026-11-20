@@ -11,6 +11,9 @@
   slim_fork.py no-tool-running <transcript>
       exits 0 when every tool call in the session's last reply has its result, so an Esc stops only Claude's
       next request, else 1, which includes a transcript that tells nothing.
+  slim_fork.py newest-prompt-id <transcript>
+      prints the prompt_id on the session's newest prompt or tool result, which names the turn that runs, or
+      else the last one that ran, and exits 0, else 1, which includes a transcript that tells nothing.
 """
 import datetime
 import os
@@ -49,7 +52,7 @@ def no_tool_running(path):
         blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
         if e["type"] == "user":
             ids = {b.get("tool_use_id") for b in blocks if b.get("type") == "tool_result"}
-            if seen or not ids:
+            if not ids:
                 return True
             answered |= ids
             continue
@@ -61,12 +64,31 @@ def no_tool_running(path):
     return seen
 
 
+def newest_prompt_id(path):
+    # Claude Code stamps each main-thread user entry, prompt or tool result, with its turn's prompt_id; replies carry
+    # none. The newest one alone decides: an older entry's id can name a turn that has ended.
+    try:
+        for e in rewrite_transcript.entries_from_end(path):
+            if e.get("type") == "user" and not e.get("isSidechain"):
+                prompt = e.get("promptId")
+                return prompt if isinstance(prompt, str) and prompt else None
+    except OSError:
+        pass
+    return None
+
+
 def main(argv):
     try:
         if len(argv) == 3 and argv[0] == "at-limit":
             return 0 if at_limit(argv[1], float(argv[2])) else 1
         if len(argv) == 2 and argv[0] == "no-tool-running":
             return 0 if no_tool_running(argv[1]) else 1
+        if len(argv) == 2 and argv[0] == "newest-prompt-id":
+            prompt = newest_prompt_id(argv[1])
+            if prompt is None:
+                return 1
+            print(prompt)
+            return 0
         if len(argv) == 2 and argv[0] == "make":
             new_id = rewrite_transcript.slim(argv[1])
             try:

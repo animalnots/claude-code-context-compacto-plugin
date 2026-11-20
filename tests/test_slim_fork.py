@@ -400,7 +400,8 @@ def test_the_cli_checks_the_limit_and_writes_a_copy_with_the_subagents(tmp_path,
     assert (tmp_path / new_id / "subagents" / "agent-a1.jsonl").read_text() == "{}\n"
 
 
-@pytest.mark.parametrize("args", [(), ("make",), ("at-limit", "x"), ("other", "x"), ("no-tool-running",)])
+@pytest.mark.parametrize("args", [(), ("make",), ("at-limit", "x"), ("other", "x"), ("no-tool-running",),
+                                  ("newest-prompt-id",), ("newest-prompt-id", "x", "y")])
 def test_the_cli_rejects_bad_arguments(args):
     assert run_cli(*args).returncode == 2
 
@@ -438,6 +439,10 @@ TWO_RUN = [PROMPT, call("a1", "u1", "t1"), call("a2", "a1", "t2")]
     (TWO_RUN + [answer("r1", "a2", "t1")], False),
     (TWO_RUN + [answer("r1", "a2", "t1"), answer("r2", "r1", "t2")], True),
     (TWO_RUN + [answer("r1", "a2", "t1", "t2")], True),
+    (TWO_RUN + [answer("r2", "a2", "t2"), call("a3", "r2", "t3"), answer("r3", "a3", "t3")], False),
+    (TWO_RUN + [answer("r1", "a2", "t1"), call("a3", "r1", "t3"), answer("r2", "a3", "t2", "t3")], True),
+    ([PROMPT, call("a0", "u1", "t0", "t9", message_id="m0"), answer("r0", "a0", "t0"), call("a1", "r0", "t1"),
+      answer("r1", "a1", "t1")], True),
     (RUNS + [answer("r1", "a1", "t1"), entry("assistant", "a2", "r1", [{"type": "thinking", "thinking": ""}],
                                              message_id="m2")], True),
     (RUNS + [answer("r1", "a1", "t1"), dict(call("s1", "r1", "t9", message_id="m9"), isSidechain=True)], True),
@@ -448,6 +453,7 @@ TWO_RUN = [PROMPT, call("a1", "u1", "t1"), call("a2", "a1", "t2")]
     ([PROMPT, entry("assistant", "a1", "u1", [{"type": "text", "text": "done"}], message_id="m1")], True),
     ([{"type": "custom-title", "customTitle": "x", "sessionId": SESSION}], False),
 ], ids=["a tool runs", "its result is in", "one of two runs", "both answered", "both in one result",
+        "an earlier call runs past a later result", "each call answered between calls", "an older reply isn't read",
         "thinking after a result", "a subagent's tool", "a notification after a running tool", "a skill's text",
         "a prompt being answered", "a finished reply", "nothing to tell from"])
 def test_a_tool_call_runs_until_its_result_is_written(tmp_path, rows, free):
@@ -458,3 +464,37 @@ def test_a_tool_call_runs_until_its_result_is_written(tmp_path, rows, free):
 
 def test_a_transcript_that_cannot_be_read_tells_nothing(tmp_path):
     assert run_cli("no-tool-running", tmp_path / "missing.jsonl").returncode == 1
+
+
+def stamped(e, prompt):
+    return dict(e, promptId=prompt)
+
+
+@pytest.mark.parametrize("rows,prompt", [
+    ([stamped(PROMPT, "p1"), stamped(answer("r1", "a1", "t1"), "p1"),
+      stamped(entry("user", "u2", "r1", "go on"), "p2")], "p2"),
+    ([stamped(PROMPT, "p1"), dict(stamped(answer("s1", "u1", "t9"), "p9"), isSidechain=True)], "p1"),
+    ([stamped(PROMPT, "p1"), entry("assistant", "a1", "u1", [{"type": "text", "text": "done"}], message_id="m1",
+                                   promptId="p9")], "p1"),
+    ([call("a1", None, "t1"), {"type": "custom-title", "customTitle": "x", "sessionId": SESSION}], None),
+    ([stamped(PROMPT, "p1"), answer("r1", "a1", "t1")], None),
+    ([stamped(PROMPT, "")], None),
+    ([stamped(PROMPT, None)], None),
+    ([stamped(PROMPT, 7)], None),
+], ids=["the newest wins", "a subagent's entry", "a reply", "no user entry", "the newest has no id", "an empty id",
+        "a null id", "an id that isn't text"])
+def test_the_newest_user_entry_names_the_turn(tmp_path, rows, prompt):
+    path = write(tmp_path, rows)
+    assert slim_fork.newest_prompt_id(str(path)) == prompt
+    r = run_cli("newest-prompt-id", path)
+    assert (r.returncode, r.stdout) == ((0, f"{prompt}\n") if prompt else (1, ""))
+
+
+def test_an_empty_or_unreadable_transcript_names_no_turn(tmp_path):
+    (tmp_path / "empty.jsonl").write_text("")
+    locked = write(tmp_path, [stamped(PROMPT, "p1")], name="locked")
+    locked.chmod(0)
+    for path in (tmp_path / "empty.jsonl", locked, tmp_path / "missing.jsonl", tmp_path):
+        assert slim_fork.newest_prompt_id(str(path)) is None
+        r = run_cli("newest-prompt-id", path)
+        assert (r.returncode, r.stdout, r.stderr) == (1, "", "")

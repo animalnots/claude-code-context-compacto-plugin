@@ -169,8 +169,7 @@ def entries_from_end(path: str, tail_bytes: int = 4 << 20) -> Iterator[Dict]:
 
 
 def last_entry(path: str, match: Callable[[Dict], bool], tail_bytes: int = 4 << 20) -> Optional[Dict]:
-    """The last entry of the transcript that match accepts, or None. The tail is read first, and the whole
-    file only when the tail has none, since transcripts of big sessions run to hundreds of MB."""
+    """The last entry of the transcript that match accepts, or None."""
     return next((e for e in entries_from_end(path, tail_bytes) if match(e)), None)
 
 

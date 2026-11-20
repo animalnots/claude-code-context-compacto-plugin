@@ -47,8 +47,8 @@ class Rig:
     def start(self, window, msgs, handoff="ok", hooked=True, draft="", daemon=True, resume="ok", ctx=True,
               compact="ok", old_hooks=False, done_for="3s", dialog=False, context=None, limit="no", suggest="",
               echo_after="0", faint_rule=False, blurred=False, session=None, raw=False, turn=0, tool=0,
-              turn_skill=False, turn_dialog=False, queued="", deaf=False, stale_dialog=False, compacting=False,
-              note=""):
+              turn_skill=False, turn_dialog=False, queued="", deaf=False, stale_dialog=False, compacting="",
+              note="", permission=False, turn_prompt=""):
         if session:
             # Where Claude Code keeps it, so the daemon can find it from the session id alone.
             moved = self.home / ".claude" / "projects" / "-w" / f"{session}.jsonl"
@@ -65,7 +65,8 @@ class Rig:
             + (["--ctx", str(context)] if context is not None else []) + (["--session", session] if session else []) \
             + (["--raw"] if raw else []) + (["--turn-skill"] if turn_skill else []) \
             + (["--turn-dialog"] if turn_dialog else []) + (["--deaf"] if deaf else []) \
-            + (["--stale-dialog"] if stale_dialog else []) + (["--compacting"] if compacting else [])
+            + (["--stale-dialog"] if stale_dialog else []) + (["--compacting", compacting] if compacting else []) \
+            + (["--permission"] if permission else []) + (["--turn-prompt", turn_prompt] if turn_prompt else [])
         subprocess.run(self.tmux + ["new-session", "-d", "-s", "t", "-n", window, "-x", "120", "-y", "30",
                                     shlex.join(cmd)], env=self.env, check=True)
         self.target = subprocess.run(self.tmux + ["display-message", "-p", "-t", "t", "#{pane_id}"],
@@ -1103,6 +1104,58 @@ def test_a_handoff_queued_behind_the_turn_runs_once_the_esc_stops_it(rig):
     assert "handoff-failed" not in rig.daemon_log()
 
 
+def finished_handoff(rig, typed_by_daemon):
+    """A handoff of session SID that ended 20 s ago, with no turn ended since."""
+    now = int(time.time())
+    if typed_by_daemon:
+        sent = rig.signal("handoffsent")
+        sent.touch()
+        os.utime(sent, (now - 40, now - 40))
+    rig.signal("handoff").write_text(f"done\t{SID}\tp-handoff\t{now - 30}\t{now - 20}\n")
+    rig.signal("hooked").write_text(f"{SID}\np-handoff\n")
+
+
+@pytest.mark.parametrize("typed_by_daemon", [True, False], ids=["typed by the daemon", "typed by hand"])
+def test_a_turn_stopped_after_a_finished_handoff_brings_a_fresh_handoff(rig, typed_by_daemon):
+    stops(rig, grace=1)
+    rig.start("gloss!", 300000, context=850000, session=SID, turn=60, hooked=False, daemon=False)
+    finished_handoff(rig, typed_by_daemon)
+    rig.start_daemon()
+    rig.wait_for("INTERRUPTED", timeout=30)
+    assert rig.wait_typed(2, timeout=30)[:2] == ["/compact-handoff", "/compact"]
+
+
+def test_an_esc_that_refuses_a_call_after_a_finished_handoff_brings_a_fresh_handoff(rig):
+    stops(rig, grace=1)
+    rig.start("gloss!", 300000, context=850000, session=SID, turn=60, tool=-1, turn_dialog=True, permission=True,
+              hooked=False, daemon=False)
+    finished_handoff(rig, True)
+    rig.start_daemon()
+    rig.wait_for("INTERRUPTED", timeout=30)
+    assert rig.wait_typed(2, timeout=30)[:2] == ["/compact-handoff", "/compact"]
+    assert rig.events().count("ESC") == 1 and "esc 1/3 (a dialog)" in rig.daemon_log()
+
+
+def test_the_handoffs_own_turn_kept_going_by_a_stop_hook_is_stopped_then_compacted(rig):
+    stops(rig, grace=1)
+    rig.start("gloss!", 300000, context=850000, session=SID, turn=60, turn_prompt="p-handoff", hooked=False,
+              daemon=False)
+    finished_handoff(rig, True)
+    rig.start_daemon()
+    rig.wait_for("INTERRUPTED", timeout=30)
+    typed = rig.wait_typed(2, timeout=30)
+    assert typed[0] == "/compact" and typed[1].startswith("/resume ")
+
+
+def test_a_stopped_turn_that_cant_be_told_from_the_handoffs_brings_a_fresh_handoff(rig):
+    stops(rig, grace=1, wait=1)
+    rig.start("gloss!", 300000, context=850000, turn=60, turn_prompt="p-handoff", hooked=False, daemon=False)
+    finished_handoff(rig, True)
+    rig.start_daemon()
+    rig.wait_for("INTERRUPTED", timeout=30)
+    assert rig.wait_typed(2, timeout=30)[:2] == ["/compact-handoff", "/compact"]
+
+
 def test_a_dialog_left_over_a_session_at_the_limit_is_closed_so_its_slim_copy_can_run(rig):
     stops(rig, grace=1)
     rig.stuck()
@@ -1110,8 +1163,8 @@ def test_a_dialog_left_over_a_session_at_the_limit_is_closed_so_its_slim_copy_ca
     typed = rig.wait_typed(2, timeout=60)
     assert typed[0] == "/compact-handoff" and typed[1].startswith("/resume ")
     assert "DIALOG_CLOSED" in rig.events()
-    log = rig.daemon_log()
-    assert "(a dialog over a session at the context limit)" in log and f"limit-resume {rig.target}" in log
+    rig.wait_log(f"limit-resume {rig.target}")
+    assert "(a dialog over a session at the context limit)" in rig.daemon_log()
 
 
 def test_a_wait_that_is_not_a_number_falls_back_to_its_default(rig):
@@ -1149,16 +1202,20 @@ def test_a_dialog_over_a_running_handoff_stays_until_the_handoff_ends(rig):
     assert "esc 1/3 (a dialog)" in rig.daemon_log()
 
 
-def test_a_compaction_that_runs_past_force_handoff_at_is_not_stopped(rig):
+@pytest.mark.parametrize("spinner", ["Compacting conversation", "Running PreCompact hooks"],
+                         ids=["Claude Code's own", "the plugin's hook"])
+def test_a_compaction_that_runs_past_force_handoff_at_is_not_stopped(rig, spinner):
     stops(rig, grace=0)
-    rig.start("gloss!", 300000, context=850000, session=SID, turn=5, compacting=True)
+    rig.start("gloss!", 300000, context=850000, session=SID, turn=5, compacting=spinner)
     rig.wait_for("IDLE", timeout=20)
     assert "ESC" not in rig.events()
 
 
-def test_a_turn_whose_text_mentions_a_compaction_is_still_stopped(rig):
+@pytest.mark.parametrize("note", ["⏺ Compacting conversation runs the hook",
+                                  "⏺ Running PreCompact hooks… took 2m"])
+def test_a_turn_whose_text_mentions_a_compaction_is_still_stopped(rig, note):
     stops(rig, grace=0)
-    rig.start("gloss!", 300000, context=850000, session=SID, turn=60, note="⏺ Compacting conversation runs the hook")
+    rig.start("gloss!", 300000, context=850000, session=SID, turn=60, note=note)
     rig.wait_for("INTERRUPTED", timeout=20)
 
 

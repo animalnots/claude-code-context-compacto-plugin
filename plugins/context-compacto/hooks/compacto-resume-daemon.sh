@@ -599,7 +599,7 @@ handoff_step() {
     unscroll_for_handoff
     [ -e "$SIGNAL_DIR/$key.handoff" ] && IFS=$'\t' read -r st sess prompt started ended < "$SIGNAL_DIR/$key.handoff"
     is_num "${started:-}" || st=""
-    force_stop "$st" "$sess" "$started"
+    force_stop "$st" "$sess" "$started" "$prompt"
     if [ -e "$hs" ]; then
         if [ -z "$st" ] || [ "$started" -lt "$(file_mtime "$hs")" ]; then
             # Typed but not started: the keys were lost, the command is unknown, or this Claude
@@ -653,7 +653,7 @@ handoff_gate_open() {
 # ends that turn with no Stop, so the handoff would read as running for good. Checked once the pane is at rest,
 # at most every LIMIT_CHECK_SECS; handoff.py names the session's transcript in $key.transcript.
 handoff_at_limit() { pane_idle "$ctgt" && limit_refused "$1" "$2"; }
-# handoff_at_limit's check without its wait for an idle pane.
+# force_stop runs this check over a dialog, which pane_idle refuses.
 limit_refused() {
     local tsess="" tpath="" src="" fork="" wedged="" n="${cpane#%}" now
     [ -e "$SIGNAL_DIR/$key.slim" ] && IFS=$'\t' read -r src fork wedged < "$SIGNAL_DIR/$key.slim"
@@ -702,10 +702,10 @@ limit_recover() {
     echo "compacto-resume-daemon: $ctgt reached the context limit; handing off from its slim copy $fork"
 }
 # Past force_handoff_at, a turn that runs on with no handoff gets an Esc so the handoff can run before the context
-# fills: FORCE_STOP_GRACE later, to give handoff.py's mid-turn reminder its chance, and between tool calls, which an
-# Esc would kill, unless one still runs FORCE_STOP_WAIT after that. $1-$3: $key.handoff's state, session and start.
+# fills: FORCE_STOP_GRACE later, to give handoff.py's mid-turn reminder its chance, and between tool calls, which an Esc
+# would kill, unless one still runs FORCE_STOP_WAIT after that. $1-$4: $key.handoff's state, session, start and prompt.
 force_stop() {
-    local n="${cpane#%}" st="$1" sess="$2" started="$3" now how=""
+    local n="${cpane#%}" st="$1" sess="$2" started="$3" prompt="$4" now how=""
     now="$(date +%s)"
     # Counts kept for a pane number that went unseen for a minute belong to an earlier pane or stretch.
     [ $((now - ${FORCE_SEEN[$n]:-0})) -le 60 ] || force_stop_reset "$n"
@@ -718,7 +718,8 @@ force_stop() {
     read_pane "$ctgt"
     case "$STATE" in busy|dialog) ;; *) force_stop_reset "$n"; return 0 ;; esac
     # A compaction is busy too; its spinner line names it, unlike prose that only mentions it.
-    printf '%s\n' "$SCREEN" | grep -qE '^(·|✢|✳|✶|✻|✽|\*) Compacting conversation' && { force_stop_reset "$n"; return 0; }
+    printf '%s\n' "$SCREEN" | grep -qE '^(·|✢|✳|✶|✻|✽|\*) (Compacting conversation|Running PreCompact hooks)' \
+        && { force_stop_reset "$n"; return 0; }
     if [ "$st" = running ] && ! moved_on "$sess" "$started"; then
         # The handoff is left to finish, unless it was refused at the limit: then a dialog over it is left from
         # before, and it hides the prompt the slim copy's /resume needs.
@@ -746,6 +747,9 @@ force_stop() {
         force_note "$n" waiting "force-stop-waiting $ctgt ctx=$cctx (a tool call is running)"
         return 0
     fi
+    # An Esc ends a turn with no Stop, so nothing else would show that a turn ran after the finished handoff. A Stop
+    # hook that keeps the handoff's own turn going doesn't count: that turn's entries keep the handoff's prompt id.
+    [ "$st" = done ] && ! turn_is "$prompt" && printf '%s\n' "$prompt" > "$SIGNAL_DIR/$key.handoffspent"
     keep_screen "$ctgt" "$key"
     $TMUX_CMD send-keys -t "$ctgt" Escape
     FORCE_ESC_AT[$n]="$now"; FORCE_ESCS[$n]=$(( ${FORCE_ESCS[$n]:-0} + 1 ))
@@ -761,19 +765,29 @@ force_note() {
     FORCE_NOTED[$1]="${FORCE_NOTED[$1]:-} $2"
     evlog "$3"
 }
-# Whether a tool call runs in the session whose turn last ended here, from its transcript. Also when that can't be
-# told, so a stop then waits out FORCE_STOP_WAIT rather than kill the call.
-tool_call_running() {
+hooked_transcript() {
     local sess="" t
     [ -e "$SIGNAL_DIR/$key.hooked" ] && IFS= read -r sess < "$SIGNAL_DIR/$key.hooked"
     sess="${sess%$'\r'}"
-    [ -n "$PYTHON" ] && [ -n "$sess" ] || return 0
+    [ -n "$sess" ] || return 1
     for t in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$sess".jsonl; do
-        [ -f "$t" ] || continue
-        ! "$PYTHON" "$HOOKS_DIR/slim_fork.py" no-tool-running "$t"
-        return
+        [ -f "$t" ] && { printf '%s\n' "$t"; return 0; }
     done
-    return 0
+    return 1
+}
+# Whether a tool call runs in the session whose turn last ended here, from its transcript. Also when that can't be
+# told, so a stop then waits out FORCE_STOP_WAIT rather than kill the call.
+tool_call_running() {
+    local t
+    [ -n "$PYTHON" ] && t="$(hooked_transcript)" || return 0
+    ! "$PYTHON" "$HOOKS_DIR/slim_fork.py" no-tool-running "$t"
+}
+# Whether the turn that runs, or else ran last, in the session whose turn last ended here has prompt id $1, from its
+# transcript. Not when that can't be told.
+turn_is() {
+    local t id
+    [ -n "$PYTHON" ] && t="$(hooked_transcript)" && id="$("$PYTHON" "$HOOKS_DIR/slim_fork.py" newest-prompt-id "$t")" \
+        && [ "${id%$'\r'}" = "$1" ]
 }
 # The handoff this daemon typed no longer covers the session: a turn ran after it (a background result that
 # came in meanwhile, say), so a /compact now would summarise what it never saved.
