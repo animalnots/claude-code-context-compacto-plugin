@@ -16,6 +16,7 @@ Beyond selecting the head/tail windows by token budget, this also:
     weight across a compaction boundary; `image` blocks are kept)
   - caps individual text / tool_result / attachment-file blocks at MAX_BLOCK_TOKENS
   - strips `message.usage` (cached API token counts) and `toolUseResult` metadata
+  - drops Claude Code's request log (`api-request*` entries)
   - reassigns every UUID so Claude Code can't re-hydrate the fork from other session files
 
 `slim()` writes the other kind of fork: a smaller copy of a session stuck at the context limit, so a turn fits again.
@@ -41,6 +42,10 @@ MAX_BLOCK_TOKENS = int(os.environ.get("PRECOMPACT_MAX_BLOCK_TOKENS", "3000"))
 
 DEFAULT_HEAD_TOKENS = 0
 DEFAULT_TAIL_TOKENS = 25000
+
+# Claude Code's log of the exact API requests it sent. Resume ignores it, and copying it would make each fork
+# carry the logs of every fork before it.
+REQUEST_LOG_TYPES = frozenset({"api-request", "api-request-shape", "api-request-blob", "api-request-resumed"})
 
 
 def resolve_budgets(total_tokens: int) -> Tuple[int, int]:
@@ -519,6 +524,8 @@ def rewrite(orig_path: str, summary: str, projects_dir: str = None) -> str:
     emitted_attach_uuids = set()
     for i, e in enumerate(entries):
         t = e.get("type")
+        if t in REQUEST_LOG_TYPES:
+            continue
 
         # Drop middle user/assistant entries AND dedupe: keep only one per UUID
         if t in ("user", "assistant"):
@@ -755,6 +762,8 @@ def slim(orig_path: str, projects_dir: str = None) -> str:
     emitted = set()
     for i, e in enumerate(entries):
         t = e.get("type")
+        if t in REQUEST_LOG_TYPES:
+            continue
         # What came after the last request kept is the refused requests' own: their prompts, errors and hooks.
         if i > cut and (e.get("uuid") or t == "attachment"):
             continue
