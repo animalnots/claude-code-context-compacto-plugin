@@ -222,6 +222,12 @@ A pane scrolled up in tmux copy-mode can't take keys, so it can't hand off. Once
 1. mid-turn, after each tool call, the plugin's `PostToolUse` hook tells Claude to finish the step in progress, run `/compact-handoff` and end its turn: once a turn, and again every 50k tokens more. A handoff Claude runs this way counts as one you typed;
 2. at the next idle prompt the daemon types `/compact-handoff`, unless one has just finished, and then `/compact`; the usual `/resume` follows.
 
+A turn that runs on is stopped. If it's still running 2 minutes after the pane is due (`COMPACTO_FORCE_STOP_GRACE`) and no handoff has started, the daemon presses Esc, and step 2 follows. A `/compact-handoff` already queued behind the turn runs as soon as the turn stops. Esc cancels a tool call that's running, so the daemon presses it only between tool calls, which it reads from the session's transcript. If no such moment comes within 5 more minutes (`COMPACTO_FORCE_STOP_WAIT`), it presses Esc anyway.
+
+The daemon presses one Esc at a time, more than 4 seconds apart, because two quick ones on an idle prompt open Claude Code's rewind menu, and it stops after 5. A dialog in the way takes the first Esc. So does a dialog left over a session at the context limit, since it would hide the prompt the slim copy needs. A pane that's scrolled up or compacting gets no Esc. An Esc leaves a draft of yours in the input box, and the handoff then waits for it (`handoff-held`).
+
+`events.log` records each Esc as `force-stop` with the reason it went then, `force-stop-waiting` while a running tool call holds it back, and `force-stop-failed` when the daemon stops trying. `force_stop=0` in `~/.claude/precompact.conf` turns the Esc off.
+
 A session whose handoff never starts (`/compact-handoff` isn't there, say) keeps its window's own rule instead, and Claude there gets no more reminders: a plain window gets `/compact`, Claude Code's own compaction included, a `!` window is left alone, and a `=` one goes on as above. A pane where no turn has ended under the handoff hooks yet keeps its window's own rule too. `events.log` records each reminder as `remind-sent`, and, at most every 5 minutes, `remind-skipped` with why a turn past `force_handoff_at` got none: the session's handoff never started, the daemon's heartbeat is stale, or Claude Code gave the tool call no prompt id.
 
 A handoff refused at the limit anyway runs in a slim copy of the session, which the daemon writes beside it: the conversation up to the refused request, from Claude Code's own last compaction of it if there was one, without its thinking or images, and with tool outputs over 3000 tokens cut. The daemon resumes that copy, hands off and compacts there; the copy's first request writes all of it to the prompt cache. A copy refused too is left to you, and so is the session it was made from: the daemon logs `limit-wedged`, and `/compact` typed twice, the second time 5 seconds to 2 minutes after the first, compacts it. `events.log` records `limit-slim` when a copy is made and `limit-resume` when it's resumed. All of this runs only while threshold compaction is on (`auto_compact_at` isn't `0`). The mid-turn reminder and the slim copy need sessions started under this version's hooks; the handoff at an idle prompt works in older ones too.
@@ -242,7 +248,7 @@ set -g window-status-current-format '#I:#{@cc_state}#W#{?window_flags,#{window_f
 
 With a themed format, put `#{@cc_state}` wherever you want the marker. Window names are never changed, so `!` opt-outs, `prefix ,` and tmux-resurrect saves are unaffected.
 
-**The fragile part — idle detection.** The daemon only types (`/compact`, `/resume`, `continue`) into Claude's plain input box, a `❯` line directly under a `───` rule, and only when the status line above that box shows a finished turn: `✻ Baked for 5m 16s · done 23:03` (or `for 1d 1h 7m`, when background agents kept running across turns for over a day), `✻ Waiting for 2 background agents to finish`, or no status line at all. Any other status line means Claude is mid-turn, however it's worded: `✳ Scurrying… (3m 53s …)`, a hook's `(Checking UI changes… · 30m 43s …)`, `Waiting for API response · will retry in 2m 40s`. `esc to interrupt` or a queued-message caption anywhere near the box also means busy. A draft in the box holds `/compact` until the box is empty again. A question, permission or trust dialog replaces the box, so the daemon waits instead of pressing Enter on it, which would pick option 1 for you. If your Claude Code words a finished turn differently, the daemon waits instead of typing. Check what it sees:
+**The fragile part — idle detection.** The daemon only types (`/compact`, `/resume`, `continue`) into Claude's plain input box, a `❯` line directly under a `───` rule, and only when the status line above that box shows a finished turn: `✻ Baked for 5m 16s · done 23:03` (or `for 1d 1h 7m`, when background agents kept running across turns for over a day), `✻ Waiting for 2 background agents to finish`, or no status line at all. Any other status line means Claude is mid-turn, however it's worded: `✳ Scurrying… (3m 53s …)`, a hook's `(Checking UI changes… · 30m 43s …)`, `Waiting for API response · will retry in 2m 40s`. `esc to interrupt` or a queued-message caption anywhere near the box also means busy. A draft in the box holds `/compact` until the box is empty again. A question, permission or trust dialog replaces the box, so the daemon waits instead of pressing Enter on it, which would pick option 1 for you. If your Claude Code words a finished turn differently, the daemon waits instead of typing. Before each key it sends, it saves the screen it read as `<pane>.keyscreen` in the signal directory, so a misread can be traced afterwards. Check what it sees:
 
 ```bash
 # once Claude is idle in pane %N, this SHOULD print a finished line like "✻ Baked for 5m 16s · done 23:03":
@@ -263,10 +269,14 @@ COMPACTO_POLL_SECS=1                     # poll interval
 COMPACTO_HANDOFF_MAX=600000              # cap on a "=" window's threshold
 COMPACTO_HANDOFF_START_TIMEOUT=60        # secs a typed handoff may take to start before it counts as failed
 COMPACTO_LIMIT_CHECK_SECS=10             # secs between checks of whether a handoff that stalled hit the context limit
+COMPACTO_FORCE_STOP_GRACE=120            # secs a turn past force_handoff_at runs with no handoff before an Esc stops it
+COMPACTO_FORCE_STOP_WAIT=300             # secs after that to wait for no tool call to run before the Esc goes anyway
+COMPACTO_FORCE_STOP_GAP=4                # secs between two Escs
+COMPACTO_FORCE_STOP_TRIES=5              # Escs before a stop is given up
 COMPACTO_PYTHON=python                   # Python for hooks/slim_fork.py (default: python, else python3, on PATH)
 ```
 
-Config keys (in `~/.claude/precompact.conf`, read live on every poll): `auto_compact_at`, `auto_compact_metric` (`msgs` | `ctx`), `resume_continue`, `handoff_command` (default `compact-handoff`), `force_handoff_at` (default `800000`, `0` = off).
+Config keys (in `~/.claude/precompact.conf`, read live on every poll): `auto_compact_at`, `auto_compact_metric` (`msgs` | `ctx`), `resume_continue`, `handoff_command` (default `compact-handoff`), `force_handoff_at` (default `800000`, `0` = off), `force_stop` (`0` or `off` = no Esc for a turn past `force_handoff_at`).
 
 ## Windows (psmux)
 

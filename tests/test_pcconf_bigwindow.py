@@ -197,3 +197,18 @@ def test_show_spells_out_force_handoff_at_as_the_daemon_reads_it(env, conf, show
     r = run_hook("pcconf.py", "", env, ["show"])
     assert r.returncode == 0, r.stderr
     assert shown in r.stdout.splitlines()[-1]
+
+
+@pytest.mark.parametrize("conf,shown", [
+    (None, "force_stop=on"),
+    ("force_stop=0\n", "force_stop=off"),
+    ("force_stop=off\n", "force_stop=off"),
+    ("force_stop=0 \n", "force_stop=on"),   # the daemon matches the value exactly
+    ("force_stop=0\nforce_stop=1\n", "force_stop=on"),
+])
+def test_show_says_whether_the_daemon_stops_turns_past_force_handoff_at(env, conf, shown):
+    if conf is not None:
+        (pathlib.Path(env["HOME"]) / ".claude" / "precompact.conf").write_text(conf)
+    r = run_hook("pcconf.py", "", env, ["show"])
+    assert r.returncode == 0, r.stderr
+    assert shown in r.stdout.splitlines()[-1]

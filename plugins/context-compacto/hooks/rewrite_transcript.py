@@ -34,7 +34,7 @@ import re
 import shutil
 import uuid
 import datetime
-from typing import List, Dict, Optional, Tuple, Callable
+from typing import List, Dict, Optional, Tuple, Callable, Iterator
 
 
 MAX_BLOCK_TOKENS = int(os.environ.get("PRECOMPACT_MAX_BLOCK_TOKENS", "3000"))
@@ -144,22 +144,33 @@ def _load_entries(path: str) -> List[Dict]:
     return entries
 
 
-def last_entry(path: str, match: Callable[[Dict], bool], tail_bytes: int = 4 << 20) -> Optional[Dict]:
-    """The last entry of the transcript that match accepts, or None. The tail is read first, and the whole
-    file only when the tail has none, since transcripts of big sessions run to hundreds of MB."""
+def entries_from_end(path: str, tail_bytes: int = 4 << 20) -> Iterator[Dict]:
+    """The transcript's entries, newest first. The rest of the file is read only once the tail's run out."""
     with open(path, "rb") as f:
         size = f.seek(0, os.SEEK_END)
-        for start in ([size - tail_bytes, 0] if size > tail_bytes else [0]):
-            f.seek(start)
-            lines = f.read().splitlines()[1 if start else 0:]
-            for raw in reversed(lines):
+        start = size - tail_bytes if size > tail_bytes else 0
+        f.seek(start)
+        lines = f.read().splitlines()
+        # The tail's first line can start before the tail, so it's read again with the rest.
+        first = lines.pop(0) if start and lines else b""
+        for batch in (lines, None):
+            if batch is None:
+                if not start:
+                    return
+                f.seek(0)
+                batch = (f.read(start) + first).splitlines()
+            for raw in reversed(batch):
                 try:
                     e = json.loads(raw)
                 except ValueError:
                     continue
-                if isinstance(e, dict) and match(e):
-                    return e
-    return None
+                if isinstance(e, dict):
+                    yield e
+
+
+def last_entry(path: str, match: Callable[[Dict], bool], tail_bytes: int = 4 << 20) -> Optional[Dict]:
+    """The last entry of the transcript that match accepts, or None."""
+    return next((e for e in entries_from_end(path, tail_bytes) if match(e)), None)
 
 
 JUNK_TITLE_PREFIXES = (

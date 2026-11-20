@@ -35,7 +35,9 @@
 #      unless its window is on screen: that one waits for you and shows "^" (behavior 4).
 #      Past force_handoff_at=<context tokens> (default 800000, 0 = off) a pane hands off and compacts
 #      the same way whatever its window's name, "!" included, and hooks/handoff.py asks Claude mid-turn
-#      to hand off and end its turn. A session whose handoff never started, or a pane where no turn has
+#      to hand off and end its turn. If the turn still runs COMPACTO_FORCE_STOP_GRACE later with no handoff
+#      started, this stops it with Esc (force_stop=0 turns that off), so the handoff can run before the
+#      context fills. A session whose handoff never started, or a pane where no turn has
 #      ended under the handoff hooks yet, keeps its window's own rule. A handoff whose request is refused
 #      at the context limit runs in a slim copy of the session instead (hooks/slim_fork.py): this resumes
 #      the copy and hands off there.
@@ -71,6 +73,10 @@
 #   COMPACTO_HANDOFF_MAX      cap on a "=" window's threshold (default 600000)
 #   COMPACTO_HANDOFF_START_TIMEOUT  secs a typed handoff may take to start before it counts as failed (default 60)
 #   COMPACTO_LIMIT_CHECK_SECS  secs between checks of whether a handoff that stalled hit the context limit (default 10)
+#   COMPACTO_FORCE_STOP_GRACE  secs a turn past force_handoff_at runs with no handoff before an Esc stops it (default 120)
+#   COMPACTO_FORCE_STOP_WAIT   secs after that to wait for no tool call to run before the Esc goes anyway (default 300)
+#   COMPACTO_FORCE_STOP_GAP    secs between two Escs (default 4)
+#   COMPACTO_FORCE_STOP_TRIES  Escs before a stop is given up (default 5)
 #   COMPACTO_PYTHON          Python for hooks/slim_fork.py (default: python, else python3, on PATH)
 #
 # Assumes a single tmux server; pane ids are unique per server. psmux (Windows) runs a server per
@@ -120,6 +126,12 @@ HANDOFF_START_TIMEOUT="${COMPACTO_HANDOFF_START_TIMEOUT:-60}"
 # daemon types /compact instead of a second handoff.
 HANDOFF_ADOPT=120
 LIMIT_CHECK_SECS="${COMPACTO_LIMIT_CHECK_SECS:-10}"
+# Whole numbers only, else the default: one that isn't would end the daemon in arithmetic, or never stop the Escs.
+FORCE_STOP_GRACE=120; [[ "${COMPACTO_FORCE_STOP_GRACE:-}" =~ ^[0-9]+$ ]] && FORCE_STOP_GRACE="$COMPACTO_FORCE_STOP_GRACE"
+FORCE_STOP_WAIT=300; [[ "${COMPACTO_FORCE_STOP_WAIT:-}" =~ ^[0-9]+$ ]] && FORCE_STOP_WAIT="$COMPACTO_FORCE_STOP_WAIT"
+# Two Escs close together on an idle prompt open Claude Code's rewind menu.
+FORCE_STOP_GAP=4; [[ "${COMPACTO_FORCE_STOP_GAP:-}" =~ ^[0-9]+$ ]] && FORCE_STOP_GAP="$COMPACTO_FORCE_STOP_GAP"
+FORCE_STOP_TRIES=5; [[ "${COMPACTO_FORCE_STOP_TRIES:-}" =~ ^[0-9]+$ ]] && FORCE_STOP_TRIES="$COMPACTO_FORCE_STOP_TRIES"
 # Python on Windows reads Git Bash's /c/Users/... as C:\c\Users\..., and MSYS_NO_PATHCONV above keeps Git Bash
 # from converting it, so this takes the C:/Users/... form; only Git Bash's pwd has -W.
 HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && { pwd -W 2>/dev/null || pwd; })"
@@ -227,10 +239,18 @@ function classify(    first, i, s, busy, box, footer, bg) {
 END { print (id != "" ? id " " : "") classify() }
 AWK
 screen_state() { BUSY_REGEX="$BUSY_REGEX" awk "$SCREEN_AWK"; }
+# Sets SCREEN to pane $1's screen and STATE to its screen_state.
+read_pane() {
+    SCREEN="$($TMUX_CMD capture-pane -p -t "$1" 2>/dev/null)"; SCREEN_OF="$1"
+    STATE="$(printf '%s\n' "$SCREEN" | screen_state)"
+}
+# Before keys go to pane $1, the screen they were sent on is kept as <key $2>.keyscreen, so a misread can be traced.
+keep_screen() { [ "${SCREEN_OF:-}" = "$1" ] && printf '%s\n' "$SCREEN" > "$SIGNAL_DIR/$2.keyscreen" 2>/dev/null; return 0; }
 pane_at_rest() {
     # Waiting on background work counts as idle: a dev server in the background never
     # finishes, so holding /compact for it could stall a pane forever.
-    case "$($TMUX_CMD capture-pane -p -t "$1" 2>/dev/null | screen_state)" in ready|background) return 0 ;; esac
+    read_pane "$1"
+    case "$STATE" in ready|background) return 0 ;; esac
     return 1
 }
 pane_idle() {
@@ -322,6 +342,7 @@ pane_box_empty() { local t; t="$(pane_box_text "$1")" && [ -z "$t" ]; }
 # what the box held, someone else's text by its length only.
 type_text() {
     local text="" seen=0 i n before; local -a erase=()
+    keep_screen "$1" "$key"
     $TMUX_CMD send-keys -t "$1" "$2"
     sleep 1
     # A busy machine can draw the keys seconds late, so the box is read again for a while before they count as lost.
@@ -444,6 +465,9 @@ HANDOFF_REDO=()
 HANDOFF_HELD=(); HANDOFF_SCROLL_LOGGED=(); BOX_HELD_LOGGED=(); TYPE_SEEN=""
 # When each pane's stalled handoff was last checked for a refusal at the context limit.
 LIMIT_CHECKED=()
+# force_stop's state per pane: since when it's been due a stop, its Escs so far and the last one's time, which of its
+# log lines are written, and when the pane was last seen.
+FORCE_DUE=(); FORCE_ESCS=(); FORCE_ESC_AT=(); FORCE_NOTED=(); FORCE_SEEN=()
 # When each pane's /compact after its handoff last failed to type.
 COMPACT_UNTYPED_AT=()
 # The daemon's own handoff -> /compact -> /resume cycle is housekeeping, not a finished turn,
@@ -575,6 +599,7 @@ handoff_step() {
     unscroll_for_handoff
     [ -e "$SIGNAL_DIR/$key.handoff" ] && IFS=$'\t' read -r st sess prompt started ended < "$SIGNAL_DIR/$key.handoff"
     is_num "${started:-}" || st=""
+    force_stop "$st" "$sess" "$started" "$prompt"
     if [ -e "$hs" ]; then
         if [ -z "$st" ] || [ "$started" -lt "$(file_mtime "$hs")" ]; then
             # Typed but not started: the keys were lost, the command is unknown, or this Claude
@@ -627,12 +652,14 @@ handoff_gate_open() {
 # Whether the request of the handoff in session $1, started at $2, was refused at the context limit. Claude Code
 # ends that turn with no Stop, so the handoff would read as running for good. Checked once the pane is at rest,
 # at most every LIMIT_CHECK_SECS; handoff.py names the session's transcript in $key.transcript.
-handoff_at_limit() {
+handoff_at_limit() { pane_idle "$ctgt" && limit_refused "$1" "$2"; }
+# force_stop runs this check over a dialog, which pane_idle refuses.
+limit_refused() {
     local tsess="" tpath="" src="" fork="" wedged="" n="${cpane#%}" now
     [ -e "$SIGNAL_DIR/$key.slim" ] && IFS=$'\t' read -r src fork wedged < "$SIGNAL_DIR/$key.slim"
     # Once a slim copy is refused too, the session it was made from is left to you as well.
     [ -n "${wedged%$'\r'}" ] && { [ "$fork" = "$1" ] || [ "$src" = "$1" ]; } && return 1
-    [ -n "$PYTHON" ] && pane_idle "$ctgt" || return 1
+    [ -n "$PYTHON" ] || return 1
     now="$(date +%s)"
     [ $(( now - ${LIMIT_CHECKED[$n]:-0} )) -ge "$LIMIT_CHECK_SECS" ] || return 1
     LIMIT_CHECKED[$n]="$now"
@@ -673,6 +700,94 @@ limit_recover() {
     $TMUX_CMD send-keys -t "$ctgt" Enter
     evlog "limit-resume $ctgt $fork"
     echo "compacto-resume-daemon: $ctgt reached the context limit; handing off from its slim copy $fork"
+}
+# Past force_handoff_at, a turn that runs on with no handoff gets an Esc so the handoff can run before the context
+# fills: FORCE_STOP_GRACE later, to give handoff.py's mid-turn reminder its chance, and between tool calls, which an Esc
+# would kill, unless one still runs FORCE_STOP_WAIT after that. $1-$4: $key.handoff's state, session, start and prompt.
+force_stop() {
+    local n="${cpane#%}" st="$1" sess="$2" started="$3" prompt="$4" now how=""
+    now="$(date +%s)"
+    # Counts kept for a pane number that went unseen for a minute belong to an earlier pane or stretch.
+    [ $((now - ${FORCE_SEEN[$n]:-0})) -le 60 ] || force_stop_reset "$n"
+    FORCE_SEEN[$n]="$now"
+    # can_force too: a "=" window reaches handoff_step on its own threshold, and a session whose handoff never
+    # started keeps that window's rule, which has no Esc.
+    [ "$FORCE_STOP" = 1 ] && over_force_limit "${cctx:-}" && can_force "$key" || { force_stop_reset "$n"; return 0; }
+    # Keys sent to a pane someone scrolled go to the scroll.
+    case "$($TMUX_CMD display-message -p -t "$ctgt" '#{pane_in_mode}' 2>/dev/null)" in [1-9]*) return 0 ;; esac
+    read_pane "$ctgt"
+    case "$STATE" in busy|dialog) ;; *) force_stop_reset "$n"; return 0 ;; esac
+    # A compaction is busy too; its spinner line names it, unlike prose that only mentions it.
+    printf '%s\n' "$SCREEN" | grep -qE '^(·|✢|✳|✶|✻|✽|\*) (Compacting conversation|Running PreCompact hooks)' \
+        && { force_stop_reset "$n"; return 0; }
+    if [ "$st" = running ] && ! moved_on "$sess" "$started"; then
+        # The handoff is left to finish, unless it was refused at the limit: then a dialog over it is left from
+        # before, and it hides the prompt the slim copy's /resume needs.
+        [ "$STATE" = dialog ] || { force_stop_reset "$n"; return 0; }
+        how="a dialog over a session at the context limit"
+    fi
+    [ -n "${FORCE_DUE[$n]:-}" ] || FORCE_DUE[$n]="$now"
+    [ $((now - FORCE_DUE[$n])) -ge "$FORCE_STOP_GRACE" ] || return 0
+    # Whole seconds: only -gt keeps two Escs at least FORCE_STOP_GAP apart.
+    [ $((now - ${FORCE_ESC_AT[$n]:-0})) -gt "$FORCE_STOP_GAP" ] || return 0
+    if [ "${FORCE_ESCS[$n]:-0}" -ge "$FORCE_STOP_TRIES" ]; then
+        force_note "$n" failed "force-stop-failed $ctgt ctx=$cctx (still $STATE after $FORCE_STOP_TRIES Escs)" \
+            && echo "compacto-resume-daemon: $ctgt is still $STATE after $FORCE_STOP_TRIES Escs; its turn is left to run" >&2
+        return 0
+    fi
+    if [ -n "$how" ]; then
+        limit_refused "$sess" "$started" || return 0
+    elif [ "$STATE" = dialog ]; then
+        how="a dialog"
+    elif ! tool_call_running; then
+        how="Claude was thinking"
+    elif [ $((now - FORCE_DUE[$n])) -ge $((FORCE_STOP_GRACE + FORCE_STOP_WAIT)) ]; then
+        how="a tool call still ran after ${FORCE_STOP_WAIT}s"
+    else
+        force_note "$n" waiting "force-stop-waiting $ctgt ctx=$cctx (a tool call is running)"
+        return 0
+    fi
+    # An Esc ends a turn with no Stop, so nothing else would show that a turn ran after the finished handoff. A Stop
+    # hook that keeps the handoff's own turn going doesn't count: that turn's entries keep the handoff's prompt id.
+    [ "$st" = done ] && ! turn_is "$prompt" && printf '%s\n' "$prompt" > "$SIGNAL_DIR/$key.handoffspent"
+    keep_screen "$ctgt" "$key"
+    $TMUX_CMD send-keys -t "$ctgt" Escape
+    FORCE_ESC_AT[$n]="$now"; FORCE_ESCS[$n]=$(( ${FORCE_ESCS[$n]:-0} + 1 ))
+    # A handoff queued behind the turn runs once the turn stops, so it may take HANDOFF_START_TIMEOUT from now to start.
+    [ -e "$hs" ] && { [ -z "$st" ] || [ "$started" -lt "$(file_mtime "$hs")" ]; } && touch "$hs"
+    evlog "force-stop $ctgt ctx=$cctx esc ${FORCE_ESCS[$n]}/$FORCE_STOP_TRIES ($how)"
+    echo "compacto-resume-daemon: Esc ${FORCE_ESCS[$n]}/$FORCE_STOP_TRIES into $ctgt ($how; ctx=$cctx >= force_handoff_at $FORCE)"
+}
+force_stop_reset() { unset "FORCE_DUE[$1]" "FORCE_ESCS[$1]" "FORCE_ESC_AT[$1]" "FORCE_NOTED[$1]"; }
+# events.log line $3 for pane number $1, once per stop for each kind $2; status 1 when it was written before.
+force_note() {
+    [[ " ${FORCE_NOTED[$1]:-} " == *" $2 "* ]] && return 1
+    FORCE_NOTED[$1]="${FORCE_NOTED[$1]:-} $2"
+    evlog "$3"
+}
+hooked_transcript() {
+    local sess="" t
+    [ -e "$SIGNAL_DIR/$key.hooked" ] && IFS= read -r sess < "$SIGNAL_DIR/$key.hooked"
+    sess="${sess%$'\r'}"
+    [ -n "$sess" ] || return 1
+    for t in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$sess".jsonl; do
+        [ -f "$t" ] && { printf '%s\n' "$t"; return 0; }
+    done
+    return 1
+}
+# Whether a tool call runs in the session whose turn last ended here, from its transcript. Also when that can't be
+# told, so a stop then waits out FORCE_STOP_WAIT rather than kill the call.
+tool_call_running() {
+    local t
+    [ -n "$PYTHON" ] && t="$(hooked_transcript)" || return 0
+    ! "$PYTHON" "$HOOKS_DIR/slim_fork.py" no-tool-running "$t"
+}
+# Whether the turn that runs, or else ran last, in the session whose turn last ended here has prompt id $1, from its
+# transcript. Not when that can't be told.
+turn_is() {
+    local t id
+    [ -n "$PYTHON" ] && t="$(hooked_transcript)" && id="$("$PYTHON" "$HOOKS_DIR/slim_fork.py" newest-prompt-id "$t")" \
+        && [ "${id%$'\r'}" = "$1" ]
 }
 # The handoff this daemon typed no longer covers the session: a turn ran after it (a background result that
 # came in meanwhile, say), so a /compact now would summarise what it never saved.
@@ -785,6 +900,7 @@ while true; do
     [ -n "$HANDOFF_CMD" ] || HANDOFF_CMD="compact-handoff"
     FORCE="$(conf_get force_handoff_at)"; [ -n "$FORCE" ] || FORCE=800000   # handoff.py's FORCE_HANDOFF_DEFAULT; off is a stored 0
     is_num "$FORCE" || FORCE=0
+    case "$(conf_get force_stop)" in 0|off) FORCE_STOP=0 ;; *) FORCE_STOP=1 ;; esac
 
     # ---- behavior 2: threshold auto-compact -------------------------------
     if is_num "$THRESH" && [ "$THRESH" -gt 0 ]; then
@@ -804,8 +920,9 @@ while true; do
                 rm -f "$cf" "$SIGNAL_DIR/$key.compacting" "$SIGNAL_DIR/$key.await-continue" "$SIGNAL_DIR/$key.lastauto" "$SIGNAL_DIR/$key.belowsince" "$SIGNAL_DIR/$key.resumewant" "$SIGNAL_DIR/$key.failcount" \
                       "$SIGNAL_DIR/$key.handoffsent" "$SIGNAL_DIR/$key.handoff" "$SIGNAL_DIR/$key.hooked" "$SIGNAL_DIR/$key.guard" "$SIGNAL_DIR/$key.compactwant" \
                       "$SIGNAL_DIR/$key.handoffspent" "$SIGNAL_DIR/$key.slim" "$SIGNAL_DIR/$key.transcript" "$SIGNAL_DIR/$key.forcenote" \
-                      "$SIGNAL_DIR/$key.nohandoff" "$SIGNAL_DIR/$key.leftover" "$SIGNAL_DIR/$key.remindskip"
-                unset "HANDOFF_REDO[${cpane#%}]" "COMPACT_UNTYPED_AT[${cpane#%}]" "BOX_HELD_LOGGED[${cpane#%}]"
+                      "$SIGNAL_DIR/$key.nohandoff" "$SIGNAL_DIR/$key.leftover" "$SIGNAL_DIR/$key.remindskip" "$SIGNAL_DIR/$key.keyscreen"
+                unset "HANDOFF_REDO[${cpane#%}]" "COMPACT_UNTYPED_AT[${cpane#%}]" "BOX_HELD_LOGGED[${cpane#%}]" "FORCE_SEEN[${cpane#%}]"
+                force_stop_reset "${cpane#%}"
                 continue
             fi
             [ "$rc" = 0 ] || continue               # same %N in several psmux sessions, no server pid to pick one
@@ -946,6 +1063,7 @@ while true; do
                 echo "compacto-resume-daemon[dbg]: fire $ctgt val=$val in_mode=$($TMUX_CMD display-message -p -t "$ctgt" '#{pane_in_mode}' 2>/dev/null) tail=[$($TMUX_CMD capture-pane -p -t "$ctgt" 2>/dev/null | grep -vE '^\s*$' | tail -1 | cut -c1-60)]" >&2
             fi
             asked=""; [ "$want" = 1 ] && asked=", asked by Claude Code"
+            keep_screen "$ctgt" "$key"
             $TMUX_CMD send-keys -t "$ctgt" "/compact" Enter
             evlog "fire $ctgt $METRIC=$val$asked"
             if [ "$want" = 1 ]; then echo "$cctx" > "$cm"; else : > "$cm"; fi
@@ -1009,6 +1127,7 @@ while true; do
         fi
         if drop_outlived_fork "$key" "$ptgt" "$fork" "$(file_mtime "$busy")"; then rm -f "$busy"; continue; fi
         rm -f "$busy"
+        keep_screen "$ptgt" "$key"
         $TMUX_CMD send-keys -t "$ptgt" "/resume $fork" Enter
         echo "compacto-resume-daemon: resumed $fork in pane $ptgt"
         evlog "resume-sent $ptgt $fork"
@@ -1056,6 +1175,7 @@ while true; do
                 evlog "resume-confirmed $rtgt $METRIC=$rval"
                 ac="$SIGNAL_DIR/$rkey.await-continue"
                 if [ -e "$ac" ] && [ -n "$CONTINUE_MSG" ] && pane_idle "$rtgt"; then
+                    keep_screen "$rtgt" "$rkey"
                     $TMUX_CMD send-keys -t "$rtgt" "$CONTINUE_MSG" Enter
                     PANE_CONTINUED[${rpane#%}]=1
                     echo "compacto-resume-daemon: continued $rtgt with: $CONTINUE_MSG"
@@ -1076,6 +1196,7 @@ while true; do
         fi
         # Re-send, paced by the marker's mtime, only into an idle frame.
         if [ "$(file_age "$w")" -ge "$RESUME_RETRY_SECS" ] && pane_idle "$rtgt"; then
+            keep_screen "$rtgt" "$rkey"
             $TMUX_CMD send-keys -t "$rtgt" "/resume $rfork" Enter
             touch "$w"
             echo "compacto-resume-daemon: resume retry for $rtgt ($rfork)"
